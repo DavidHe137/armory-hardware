@@ -18,7 +18,6 @@ dependencies = [
 
 [project.optional-dependencies]
 trial = [
-    "armory",
     "imageio-ffmpeg",
     "requests",
     "tqdm",
@@ -27,9 +26,6 @@ trial = [
 
 [project.scripts]
 armory-tui = "armory_tui.main:run"
-
-[tool.uv.sources]
-armory = { path = "../armory", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
