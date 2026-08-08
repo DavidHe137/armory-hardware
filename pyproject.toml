@@ -27,6 +27,11 @@ trial = [
 [project.scripts]
 armory-tui = "armory_tui.main:run"
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
