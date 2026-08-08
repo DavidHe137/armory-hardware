@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import curses
+import textwrap
 import threading
 import time
 from collections import deque
@@ -26,6 +27,9 @@ PAIR_HIGHLIGHT = 8
 PAIR_MUTED = 9
 PAIR_NOTICE = 10
 PAIR_SURFACE = 11
+
+MAX_RESULT_CHARS = 400
+MAX_LOG_WRAP_ROWS = 4
 
 MIN_WIDTH = 80
 MIN_HEIGHT = 24
@@ -233,7 +237,7 @@ class Dashboard:
                 self._busy = False
             if results:
                 for rid, out in results.items():
-                    self._log(f"  WS-{rid}: {str(out)[:80]}")
+                    self._log(f"  WS-{rid}: {self._format_result(out)}")
             self._announce_runtime_state()
             self._log(f"'{name}' complete.")
 
@@ -257,7 +261,7 @@ class Dashboard:
                 self._busy = False
             if results:
                 for rid, out in results.items():
-                    self._log(f"  WS-{rid}: {str(out)[:80]}")
+                    self._log(f"  WS-{rid}: {self._format_result(out)}")
             self._announce_runtime_state()
             self._log("Boot complete.")
 
@@ -285,7 +289,7 @@ class Dashboard:
                 self._busy = False
             if results:
                 for rid, out in results.items():
-                    self._log(f"  WS-{rid}: {str(out)[:80]}")
+                    self._log(f"  WS-{rid}: {self._format_result(out)}")
             self._announce_runtime_state()
             self._log("Shutdown complete.")
 
@@ -309,7 +313,7 @@ class Dashboard:
                 self._busy = False
             if results:
                 for rid, out in results.items():
-                    self._log(f"  WS-{rid}: {str(out)[:80]}")
+                    self._log(f"  WS-{rid}: {self._format_result(out)}")
             self._log("Start Tunnel complete.")
 
         self.dispatcher.start_tunnel(targets, callback=on_done)
@@ -332,7 +336,7 @@ class Dashboard:
                 self._busy = False
             if results:
                 for rid, out in results.items():
-                    self._log(f"  WS-{rid}: {str(out)[:80]}")
+                    self._log(f"  WS-{rid}: {self._format_result(out)}")
             self._log("Kill Tunnel complete.")
 
         self.dispatcher.kill_tunnel(targets, callback=on_done)
@@ -433,7 +437,7 @@ class Dashboard:
                 self._busy = False
             if results:
                 for rid, out in results.items():
-                    self._log(f"  WS-{rid}: {str(out)[:80]}")
+                    self._log(f"  WS-{rid}: {self._format_result(out)}")
             if process_key == "client":
                 self._update_client_state_from_results(
                     targets,
@@ -551,7 +555,7 @@ class Dashboard:
                 )
             if results:
                 for rid, out in results.items():
-                    self._log(f"  WS-{rid}: {str(out)[:80]}")
+                    self._log(f"  WS-{rid}: {self._format_result(out)}")
             self._set_notice("Emergency client stop complete.", seconds=3.0)
             self._log("Emergency client stop complete.")
             self._refresh_client_status()
@@ -933,8 +937,8 @@ class Dashboard:
         stdscr = self._stdscr
         self._draw_box(stdscr, y, x, h, w, "Signal Log")
 
-        visible = list(self.log_lines)[-max(0, h - 2) :]
-        if not visible:
+        capacity = max(0, h - 2)
+        if not self.log_lines:
             self._center_text(
                 stdscr,
                 y + 2,
@@ -945,6 +949,15 @@ class Dashboard:
             )
             return
 
+        text_w = max(1, w - 4)
+        rows: list[str] = []
+        # Wrap from the newest entry backwards so the tail always fills the panel.
+        for line in reversed(self.log_lines):
+            rows[:0] = self._wrap_log_line(line, text_w)
+            if len(rows) >= capacity:
+                break
+        visible = rows[-capacity:] if capacity else []
+
         row = y + 1
         for line in visible:
             if row >= y + h - 1:
@@ -953,10 +966,28 @@ class Dashboard:
                 stdscr,
                 row,
                 x + 2,
-                line[: w - 4],
+                line,
                 curses.color_pair(PAIR_LOG),
             )
             row += 1
+
+    @staticmethod
+    def _wrap_log_line(line: str, width: int) -> list[str]:
+        """Wrap one log entry, hanging-indenting continuations under the message."""
+        # Align continuations past the "[HH:MM:SS] " stamp, but never so far that
+        # a narrow panel leaves no room for text.
+        indent = " " * min(11, max(0, width - 8))
+        wrapped = textwrap.wrap(
+            line,
+            width=width,
+            subsequent_indent=indent,
+            break_long_words=True,
+            break_on_hyphens=False,
+        ) or [""]
+        if len(wrapped) > MAX_LOG_WRAP_ROWS:
+            wrapped = wrapped[:MAX_LOG_WRAP_ROWS]
+            wrapped[-1] = wrapped[-1][: max(1, width - 1)].rstrip() + "…"
+        return wrapped
 
     # ── helpers ─────────────────────────────────────────────────
 
@@ -1102,6 +1133,14 @@ class Dashboard:
         self.log_lines.append(f"[{ts}] {msg}")
         if self.fleet is not None:
             self.fleet.system_logger.info(msg)
+
+    @staticmethod
+    def _format_result(out) -> str:
+        """Flatten a command result into a single loggable line."""
+        text = " ".join(str(out).split())
+        if len(text) > MAX_RESULT_CHARS:
+            text = text[: MAX_RESULT_CHARS - 1] + "…"
+        return text
 
     def _draw_box(
         self,
