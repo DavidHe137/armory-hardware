@@ -31,6 +31,9 @@ PAIR_SURFACE = 11
 MAX_RESULT_CHARS = 400
 MAX_LOG_WRAP_ROWS = 4
 
+PANE_FLEET = "fleet"
+PANE_LOG = "log"
+
 MIN_WIDTH = 80
 MIN_HEIGHT = 24
 
@@ -81,6 +84,11 @@ class Dashboard:
         self._client_running_robot_ids: set[int] = set()
         self._client_status_pending = False
         self._emergency_stop_active = False
+        self._active_pane = PANE_FLEET
+        # Rows scrolled up from the newest entry; 0 means "follow the tail".
+        self._log_scroll = 0
+        self._log_rows_total = 0
+        self._log_capacity = 1
 
     # ── public entry point ──────────────────────────────────────
 
@@ -126,6 +134,15 @@ class Dashboard:
         if ch == "Q":
             return True
 
+        # Pane switching and log scrolling are read-only, so they stay live even
+        # while a command (or an emergency stop) is running.
+        if key in (ord("\t"), curses.KEY_BTAB):
+            self._toggle_pane()
+            return False
+
+        if self._active_pane == PANE_LOG and self._handle_log_scroll(key, ch):
+            return False
+
         if self._emergency_stop_active:
             now = time.time()
             if now - self._last_busy_notice > 1.5:
@@ -133,10 +150,10 @@ class Dashboard:
                 self._log("Emergency client stop is still running.")
             return False
 
-        if key in (curses.KEY_UP, curses.KEY_BTAB) or ch == "K":
+        if key == curses.KEY_UP or ch == "K":
             self._move_robot_focus(-1)
             return False
-        if key in (curses.KEY_DOWN, ord("\t")) or ch == "J":
+        if key == curses.KEY_DOWN or ch == "J":
             self._move_robot_focus(1)
             return False
         if ch == " ":
@@ -784,7 +801,9 @@ class Dashboard:
 
     def _draw_side_panel(self, y: int, x: int, h: int, w: int):
         stdscr = self._stdscr
-        self._draw_box(stdscr, y, x, h, w, "Fleet Matrix")
+        self._draw_box(
+            stdscr, y, x, h, w, "Fleet Matrix", active=self._active_pane == PANE_FLEET
+        )
 
         total = len(self.config.robots)
         ready = self._ready_robot_count()
@@ -843,12 +862,18 @@ class Dashboard:
                 row += 1
 
         if h >= 8:
-            footer = (
-                "SPACE = KILL CLIENTS NOW"
-                if self._clients_running()
-                else "Up/Down focus | Space selects target subset"
-            )
-            footer_pair = PAIR_OFFLINE if self._clients_running() else PAIR_MUTED
+            if self._clients_running():
+                footer_pair = PAIR_OFFLINE
+                choices = ["SPACE = KILL CLIENTS NOW", "SPACE = KILL CLIENTS"]
+            else:
+                footer_pair = PAIR_MUTED
+                choices = [
+                    "Up/Down focus | Space selects | Tab = Signal Log",
+                    "Up/Down focus | Space select | Tab = Log",
+                    "Up/Down | Space | Tab = Log",
+                    "Tab = Log",
+                ]
+            footer = self._fit_text(choices, w - 2)
             self._center_text(
                 stdscr,
                 y + h - 2,
@@ -935,9 +960,27 @@ class Dashboard:
 
     def _draw_log_panel(self, y: int, x: int, h: int, w: int):
         stdscr = self._stdscr
-        self._draw_box(stdscr, y, x, h, w, "Signal Log")
+        active = self._active_pane == PANE_LOG
 
-        capacity = max(0, h - 2)
+        capacity = max(1, h - 2)
+        text_w = max(1, w - 4)
+        rows: list[str] = []
+        for line in self.log_lines:
+            rows.extend(self._wrap_log_line(line, text_w))
+
+        # Keep the view anchored to the same content when entries arrive while
+        # the user is scrolled up; snap back to the tail once they scroll down.
+        if self._log_scroll > 0:
+            self._log_scroll += max(0, len(rows) - self._log_rows_total)
+        self._log_rows_total = len(rows)
+        self._log_capacity = capacity
+        self._log_scroll = max(0, min(self._log_scroll, self._max_log_scroll()))
+
+        title = "Signal Log"
+        if self._log_scroll > 0:
+            title = f"Signal Log — PAUSED ({self._log_scroll} newer)"
+        self._draw_box(stdscr, y, x, h, w, title, active=active)
+
         if not self.log_lines:
             self._center_text(
                 stdscr,
@@ -949,14 +992,8 @@ class Dashboard:
             )
             return
 
-        text_w = max(1, w - 4)
-        rows: list[str] = []
-        # Wrap from the newest entry backwards so the tail always fills the panel.
-        for line in reversed(self.log_lines):
-            rows[:0] = self._wrap_log_line(line, text_w)
-            if len(rows) >= capacity:
-                break
-        visible = rows[-capacity:] if capacity else []
+        end = len(rows) - self._log_scroll
+        visible = rows[max(0, end - capacity) : end]
 
         row = y + 1
         for line in visible:
@@ -970,6 +1007,40 @@ class Dashboard:
                 curses.color_pair(PAIR_LOG),
             )
             row += 1
+
+        if active and h >= 4:
+            self._draw_border_hint(
+                y + h - 1,
+                x,
+                w,
+                [
+                    "Up/Down scroll · PgUp/PgDn page · End = live · Tab = Fleet Matrix",
+                    "Up/Down scroll · End = live · Tab = Fleet",
+                    "End = live · Tab = Fleet",
+                ],
+            )
+
+    def _draw_border_hint(self, y: int, x: int, w: int, hints: list[str]):
+        """Right-align the longest hint that fits on a panel's bottom border."""
+        for hint in hints:
+            label = f" {hint} "
+            if len(label) + 4 <= w:
+                self._add_text(
+                    self._stdscr,
+                    y,
+                    x + w - len(label) - 2,
+                    label,
+                    curses.color_pair(PAIR_MUTED),
+                )
+                return
+
+    @staticmethod
+    def _fit_text(choices: list[str], width: int) -> str:
+        """Return the first choice that fits in `width`, else the shortest, clipped."""
+        for text in choices:
+            if len(text) <= width:
+                return text
+        return choices[-1][: max(0, width)]
 
     @staticmethod
     def _wrap_log_line(line: str, width: int) -> list[str]:
@@ -1016,6 +1087,39 @@ class Dashboard:
         if not self.config.robots:
             return
         self._focused_robot_idx = (self._focused_robot_idx + delta) % len(self.config.robots)
+
+    # ── pane focus & log scrolling ──────────────────────────────
+
+    def _toggle_pane(self):
+        if self._active_pane == PANE_FLEET:
+            self._active_pane = PANE_LOG
+        else:
+            self._active_pane = PANE_FLEET
+            self._log_scroll = 0
+
+    def _handle_log_scroll(self, key: int, ch: str) -> bool:
+        """Apply a scroll key to the log. Returns True if the key was consumed."""
+        page = max(1, self._log_capacity - 1)
+        if key == curses.KEY_UP or ch == "K":
+            delta = 1
+        elif key == curses.KEY_DOWN or ch == "J":
+            delta = -1
+        elif key == curses.KEY_PPAGE:
+            delta = page
+        elif key == curses.KEY_NPAGE:
+            delta = -page
+        elif key == curses.KEY_HOME:
+            delta = self._max_log_scroll()
+        elif key == curses.KEY_END:
+            delta = -self._log_scroll
+        else:
+            return False
+
+        self._log_scroll = max(0, min(self._log_scroll + delta, self._max_log_scroll()))
+        return True
+
+    def _max_log_scroll(self) -> int:
+        return max(0, self._log_rows_total - self._log_capacity)
 
     def _toggle_focused_robot(self):
         robot = self._focused_robot()
@@ -1150,16 +1254,23 @@ class Dashboard:
         h: int,
         w: int,
         title: str,
+        active: bool = False,
     ):
         if h < 3 or w < 6:
             return
 
-        border_attr = curses.color_pair(PAIR_BORDER)
-        self._add_text(target, y, x, f"╭{'─' * (w - 2)}╮", border_attr)
+        border_attr = curses.color_pair(PAIR_HIGHLIGHT if active else PAIR_BORDER)
+        if active:
+            border_attr |= curses.A_BOLD
+            tl, tr, bl, br, horiz, vert = "╔", "╗", "╚", "╝", "═", "║"
+        else:
+            tl, tr, bl, br, horiz, vert = "╭", "╮", "╰", "╯", "─", "│"
+
+        self._add_text(target, y, x, f"{tl}{horiz * (w - 2)}{tr}", border_attr)
         for row in range(y + 1, y + h - 1):
-            self._add_text(target, row, x, "│", border_attr)
-            self._add_text(target, row, x + w - 1, "│", border_attr)
-        self._add_text(target, y + h - 1, x, f"╰{'─' * (w - 2)}╯", border_attr)
+            self._add_text(target, row, x, vert, border_attr)
+            self._add_text(target, row, x + w - 1, vert, border_attr)
+        self._add_text(target, y + h - 1, x, f"{bl}{horiz * (w - 2)}{br}", border_attr)
 
         label = f" {title} "
         label_x = x + max(2, min(w - len(label) - 2, 3))
