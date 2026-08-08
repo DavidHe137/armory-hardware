@@ -614,9 +614,14 @@ class FleetController:
             callback(results)
         return results
 
-    @staticmethod
-    def _webcam_rtsp_url(robot: Robot) -> str:
-        return f"rtsp://130.207.121.217:8554/workstation{robot.id}"
+    def _webcam_rtsp_url(self, robot: Robot) -> str:
+        base = self.config.webcam_rtsp_base_url
+        if not base:
+            raise RuntimeError(
+                "No webcam RTSP server configured. Set ARMORY_WEBCAM_RTSP_BASE_URL in .env "
+                "(or webcam.rtsp_base_url in the fleet YAML)."
+            )
+        return f"{base.rstrip('/')}/workstation{robot.id}"
 
     async def _start_webcam_single(self, robot: Robot) -> str:
         logger = self._loggers[robot.id]

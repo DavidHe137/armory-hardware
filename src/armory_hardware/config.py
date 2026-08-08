@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import getpass
 import os
 import random
 from dataclasses import dataclass
@@ -44,6 +45,18 @@ def _armory_repo_root(config_path: str) -> str:
     return d
 
 
+def _setting(yaml_value, env_var: str, default: str) -> str:
+    """Resolve one setting: explicit YAML value, else ``env_var``, else ``default``.
+
+    YAML wins so a checked-in config stays authoritative and tests stay hermetic; the
+    environment fills in the per-operator values that are deliberately absent from the
+    committed config. Blank YAML values are treated as absent.
+    """
+    if yaml_value is not None and str(yaml_value).strip() != "":
+        return str(yaml_value).strip()
+    return os.environ.get(env_var, "").strip() or default
+
+
 def _generate_name(used: set[str]) -> str:
     while True:
         name = random.choice(_NAMES)
@@ -64,16 +77,21 @@ class FleetConfig:
 
         self._config_path = os.path.abspath(config_path)
 
-        ssh_cfg = raw.get("ssh", {})
-        self.ssh_user = ssh_cfg.get("user", "rbansal66")
-        self.base_ip = ssh_cfg.get("base_ip", "130.207.121")
-        self.ip_offset = ssh_cfg.get("ip_offset", 200)
+        ssh_cfg = raw.get("ssh") or {}
+        self.ssh_user = _setting(ssh_cfg.get("user"), "ARMORY_SSH_USER", getpass.getuser())
+        self.base_ip = _setting(ssh_cfg.get("base_ip"), "ARMORY_SSH_BASE_IP", "127.0.0")
+        self.ip_offset = int(_setting(ssh_cfg.get("ip_offset"), "ARMORY_SSH_IP_OFFSET", "200"))
 
-        tunnel_cfg = raw.get("tunnel", {})
-        self.tunnel_node = str(tunnel_cfg.get("node", "") or "")
-        self.tunnel_port = int(tunnel_cfg.get("port", 8080))
-        self.tunnel_user = str(tunnel_cfg.get("user", self.ssh_user) or self.ssh_user)
-        self.tunnel_server = str(tunnel_cfg.get("server", "sky1.cc.gatech.edu") or "")
+        tunnel_cfg = raw.get("tunnel") or {}
+        self.tunnel_node = _setting(tunnel_cfg.get("node"), "ARMORY_TUNNEL_NODE", "")
+        self.tunnel_port = int(_setting(tunnel_cfg.get("port"), "ARMORY_TUNNEL_PORT", "8080"))
+        self.tunnel_user = _setting(tunnel_cfg.get("user"), "ARMORY_TUNNEL_USER", self.ssh_user)
+        self.tunnel_server = _setting(tunnel_cfg.get("server"), "ARMORY_TUNNEL_SERVER", "")
+
+        webcam_cfg = raw.get("webcam") or {}
+        self.webcam_rtsp_base_url = _setting(
+            webcam_cfg.get("rtsp_base_url"), "ARMORY_WEBCAM_RTSP_BASE_URL", ""
+        )
 
         used_names: set[str] = set()
         self.robots: list[Robot] = []

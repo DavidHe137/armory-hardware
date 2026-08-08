@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import getpass
 import os
 from textwrap import dedent
 
@@ -55,7 +56,26 @@ def test_get_robot_returns_match_or_none(tmp_path):
     assert cfg.get_robot(999) is None
 
 
-def test_tunnel_defaults_when_section_missing(tmp_path):
+_ENV_VARS = [
+    "ARMORY_SSH_USER",
+    "ARMORY_SSH_BASE_IP",
+    "ARMORY_SSH_IP_OFFSET",
+    "ARMORY_TUNNEL_NODE",
+    "ARMORY_TUNNEL_PORT",
+    "ARMORY_TUNNEL_USER",
+    "ARMORY_TUNNEL_SERVER",
+    "ARMORY_WEBCAM_RTSP_BASE_URL",
+]
+
+
+@pytest.fixture
+def clean_env(monkeypatch):
+    """Drop any ARMORY_* overrides so default resolution is testable."""
+    for name in _ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_tunnel_defaults_when_section_missing(tmp_path, clean_env):
     cfg_path = _write_yaml(
         tmp_path / "fleet.yaml",
         """
@@ -69,7 +89,86 @@ def test_tunnel_defaults_when_section_missing(tmp_path):
     assert cfg.tunnel_node == ""
     assert cfg.tunnel_port == 8080
     assert cfg.tunnel_user == cfg.ssh_user
-    assert cfg.tunnel_server == "sky1.cc.gatech.edu"
+    assert cfg.tunnel_server == ""
+    assert cfg.webcam_rtsp_base_url == ""
+
+
+def test_ssh_defaults_to_local_user_and_placeholder_range(tmp_path, clean_env):
+    """No committed config or env means no borrowed identity: local user, loopback."""
+    cfg_path = _write_yaml(
+        tmp_path / "fleet.yaml",
+        """
+        workstations:
+          - id: 1
+        """,
+    )
+
+    cfg = FleetConfig(cfg_path)
+
+    assert cfg.ssh_user == getpass.getuser()
+    assert cfg.base_ip == "127.0.0"
+    assert cfg.robots[0].ip == "127.0.0.201"
+
+
+def test_env_supplies_settings_absent_from_yaml(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARMORY_SSH_USER", "envuser")
+    monkeypatch.setenv("ARMORY_SSH_BASE_IP", "192.168.1")
+    monkeypatch.setenv("ARMORY_SSH_IP_OFFSET", "10")
+    monkeypatch.setenv("ARMORY_TUNNEL_SERVER", "jump.example.edu")
+    monkeypatch.setenv("ARMORY_TUNNEL_NODE", "envnode")
+    monkeypatch.setenv("ARMORY_TUNNEL_PORT", "9090")
+    monkeypatch.delenv("ARMORY_TUNNEL_USER", raising=False)
+    monkeypatch.setenv("ARMORY_WEBCAM_RTSP_BASE_URL", "rtsp://cam.example:8554")
+
+    cfg_path = _write_yaml(
+        tmp_path / "fleet.yaml",
+        """
+        workstations:
+          - id: 3
+        """,
+    )
+
+    cfg = FleetConfig(cfg_path)
+
+    assert cfg.ssh_user == "envuser"
+    assert cfg.robots[0].ip == "192.168.1.13"
+    assert cfg.tunnel_server == "jump.example.edu"
+    assert cfg.tunnel_node == "envnode"
+    assert cfg.tunnel_port == 9090
+    # Falls back to ssh_user, which itself came from the environment.
+    assert cfg.tunnel_user == "envuser"
+    assert cfg.webcam_rtsp_base_url == "rtsp://cam.example:8554"
+
+
+def test_yaml_value_beats_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARMORY_SSH_USER", "envuser")
+    monkeypatch.setenv("ARMORY_TUNNEL_SERVER", "env.example.edu")
+
+    cfg_path = _write_yaml(
+        tmp_path / "fleet.yaml",
+        """
+        workstations:
+          - id: 1
+        ssh:
+          user: yamluser
+        tunnel:
+          server: yaml.example.edu
+        """,
+    )
+
+    cfg = FleetConfig(cfg_path)
+
+    assert cfg.ssh_user == "yamluser"
+    assert cfg.tunnel_server == "yaml.example.edu"
+
+
+def test_no_personal_identifiers_in_committed_config():
+    """The checked-in fleet config must not carry an operator's account or hosts."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    text = open(os.path.join(repo_root, "configs", "armory-tui.yaml")).read()
+
+    for section in ("ssh:", "tunnel:", "webcam:"):
+        assert section not in text
 
 
 def test_log_dir_defaults_to_repo_root_logs_tui(tmp_path):

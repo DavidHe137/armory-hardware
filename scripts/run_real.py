@@ -34,13 +34,13 @@ import tyro
 import yaml
 
 from armory_hardware import FleetConfig, FleetController, FleetDispatcher, RobotStatus
+from armory_hardware.env import load_env
 
 logger = logging.getLogger("run_real")
 
-# Mirrors the publisher URL the workstation-side ffmpeg writes to
-# (src/armory/real/fleet.py:_webcam_rtsp_url). Per-robot path is
-# ``{base}/workstation{robot.id}``.
-WEBCAM_RTSP_BASE_URL = "rtsp://130.207.121.217:8554"
+# The publisher URL the workstation-side ffmpeg writes to comes from the fleet config
+# (webcam.rtsp_base_url / ARMORY_WEBCAM_RTSP_BASE_URL), mirroring
+# FleetController._webcam_rtsp_url. Per-robot path is ``{base}/workstation{robot.id}``.
 WEBCAM_RECORDER_GRACE_SEC = 3.0
 
 
@@ -296,7 +296,7 @@ def _reset_server_metrics(args: Args) -> None:
 def _start_webcam_recorders(
     targets: list,
     out_dir: pathlib.Path,
-    rtsp_base: str = WEBCAM_RTSP_BASE_URL,
+    rtsp_base: str,
 ) -> list[tuple]:
     """Spawn one host-side ffmpeg per robot to record its mediamtx RTSP stream.
 
@@ -463,6 +463,7 @@ def _await_trial_with_progress(
 def main(args: Args) -> None:
     _setup_logging(args.debug)
 
+    load_env()
     cfg = FleetConfig(args.config_path or _default_config_path())
     fleet = FleetController(cfg, logger=logging.getLogger("armory_hardware"))
     fleet.start()
@@ -551,7 +552,9 @@ def main(args: Args) -> None:
         def _on_clients_running() -> None:
             if not args.save_videos:
                 return
-            recorders.extend(_start_webcam_recorders(targets, out))
+            recorders.extend(
+                _start_webcam_recorders(targets, out, cfg.webcam_rtsp_base_url)
+            )
 
         def _on_clients_stopping() -> None:
             _request_recorder_stop(recorders)

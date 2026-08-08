@@ -1,8 +1,12 @@
-# Fleet / SSH settings for armory-tui (see FleetConfig).
+# Fleet layout for armory-tui (see FleetConfig).
+#
+# Operator-specific values -- SSH account, address range, jump host, camera server --
+# are NOT stored here. They come from .env (copy .env.example) or the environment.
+# Adding an ssh/tunnel/webcam key below overrides the environment for that value.
 
 logging:
   # Per-workstation and system file logs (workstation_*.log, armory_system.log).
-  # Relative paths are resolved from the Armory repo root when this file lives under
+  # Relative paths are resolved from the repo root when this file lives under
   # configs/. Use an absolute path to write logs elsewhere.
   log_dir: logs/tui
 
@@ -21,13 +25,3 @@ workstations:
   - id: 12
   - id: 13
   - id: 14
-ssh:
-  user: rbansal66
-  base_ip: "130.207.121"
-  ip_offset: 200
-
-tunnel:
-  node: "bishop"
-  port: 8080
-  user: rbansal66
-  server: "sky1.cc.gatech.edu"

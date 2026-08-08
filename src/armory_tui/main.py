@@ -10,6 +10,7 @@ import signal
 import sys
 
 from armory_hardware import FleetConfig, FleetController, FleetDispatcher
+from armory_hardware.env import load_env
 from armory_tui.dashboard import Dashboard
 
 # ── ASCII splash ────────────────────────────────────────────────
@@ -167,6 +168,7 @@ def main():
 
 def run():
     """Console-script entry point: splash + main."""
+    load_env()
     bootup()
     main()
 
