@@ -51,6 +51,41 @@ PIPER_ROS_SETUP = "/piper_ros/install/setup.bash"
 PIPER_RC_SETUP = "/piper_ros/scripts/setup_rc.sh"
 PIPER_LD_LIBRARY_PATH = "/usr/lib/x86_64-linux-gnu"
 
+# Workspace build (see _ensure_workspace_built).
+#
+# /piper_ros is the same NFS checkout on every workstation — the bind-mount
+# source under piper_root is an operator home directory served to the whole lab.
+# So `src/` can gain a node (and setup.py an entry point) without `install/`
+# ever being rebuilt, and `ros2 run` then fails with a bare "No executable
+# found" in the client log, minutes into a session. Boot checks for the
+# installed executable directly and rebuilds the one package when it is absent.
+#
+# One shared tree also means the build is a fleet-level operation, not a
+# per-container one: _boot_robots elects a single workstation to run it rather
+# than letting 14 containers colcon-build into the same install/ at once.
+PIPER_PACKAGE = "piper"
+PIPER_WORKSPACE_ROOT = "/piper_ros"
+PIPER_CLIENT_EXECUTABLE = "piper_client_armory"
+PIPER_CLIENT_EXECUTABLE_PATH = (
+    f"{PIPER_WORKSPACE_ROOT}/install/{PIPER_PACKAGE}/lib/{PIPER_PACKAGE}/"
+    f"{PIPER_CLIENT_EXECUTABLE}"
+)
+ROS_UNDERLAY_SETUP = "/opt/ros/humble/setup.bash"
+# Second line of defence against two operators booting at once — flock over
+# NFSv4 is advisory and not perfectly reliable, so the single-builder election
+# in _boot_robots is what actually prevents concurrent builds.
+PIPER_BUILD_LOCK = f"{PIPER_WORKSPACE_ROOT}/.armory_build.lock"
+# Exit status of the last build, on the workstation host that ran it.
+PIPER_BUILD_STATUS_PATH = "/tmp/armory_workspace_build.status"
+DEFAULT_BUILD_TIMEOUT_SEC = 900.0
+BUILD_POLL_INTERVAL_SEC = 5.0
+BUILD_PROGRESS_INTERVAL_SEC = 30.0
+# Shorter than the overall cap so a contended lock reports as such rather than
+# consuming the whole build budget waiting.
+BUILD_LOCK_WAIT_SEC = 300.0
+# Distinct exit status for "someone else is already building" (EX_TEMPFAIL).
+BUILD_LOCK_BUSY_STATUS = 75
+
 # Emitted by an interactive bash with no controlling terminal. Harmless, but it
 # lands on stderr and used to be reported as though the command had failed.
 _JOB_CONTROL_NOISE = (
@@ -171,6 +206,21 @@ class FleetController:
     ):
         """Stop and remove the Docker container on multiple robots."""
         return self.submit(self._shutdown_robots(robots, callback))
+
+    def build_workspace(
+        self,
+        robots: list[Robot],
+        callback: Callable | None = None,
+    ):
+        """Rebuild the piper workspace, unconditionally.
+
+        Boot already does this on its own when the client executable is missing;
+        this is the explicit form, for when ``src/`` changed under an executable
+        that is still installed. ``robots`` selects which workstation runs the
+        build — the workspace itself is one shared checkout, so only the first
+        is used.
+        """
+        return self.submit(self._build_workspace_on_first(robots, callback))
 
     def start_tunnels(
         self,
@@ -415,6 +465,14 @@ class FleetController:
         outputs = await asyncio.gather(*tasks, return_exceptions=True)
         for robot, out in zip(robots, outputs):
             results[robot.id] = out
+
+        # The workspace is shared, so one workstation answers for the fleet.
+        booted = [r for r in robots if r.status is RobotStatus.BOOTED]
+        if booted:
+            note = await self._ensure_workspace_built(booted[0])
+            if note:
+                results[booted[0].id] = f"{results[booted[0].id]}; {note}"
+
         if callback:
             callback(results)
         return results
@@ -539,6 +597,246 @@ class FleetController:
             self._emit(f"WS-{robot.id}: boot FAILED — {e}")
             robot.status = RobotStatus.OFFLINE
             return f"ERROR: {e}"
+
+    # ── workspace build (fleet-level, shared /piper_ros) ─────────
+
+    async def _build_workspace_on_first(
+        self,
+        robots: list[Robot],
+        callback: Callable | None = None,
+    ):
+        results: dict[int, str] = {}
+        builders = [r for r in robots if r.status is not RobotStatus.OFFLINE]
+        if not builders:
+            self._emit("workspace build skipped — no booted workstation to build on")
+            if callback:
+                callback(results)
+            return results
+
+        builder = builders[0]
+        note = await self._ensure_workspace_built(builder, force=True)
+        results[builder.id] = note or "workspace already up to date"
+        if callback:
+            callback(results)
+        return results
+
+    async def _client_executable_present(
+        self,
+        conn: asyncssh.SSHClientConnection,
+    ) -> bool:
+        """True when the installed overlay actually carries the client node.
+
+        A ``test -x`` on the installed script, not ``ros2 pkg executables`` —
+        the package resolves either way, and it is the executable's absence
+        that ``ros2 run`` reports as the unhelpful "No executable found".
+        """
+        probe = await conn.run(
+            f"docker exec {DOCKER_CONTAINER} "
+            f"test -x {shlex.quote(PIPER_CLIENT_EXECUTABLE_PATH)}",
+            timeout=15,
+            check=False,
+        )
+        return probe.exit_status == 0
+
+    async def _ensure_workspace_built(
+        self,
+        robot: Robot,
+        force: bool = False,
+    ) -> str | None:
+        """Build the piper workspace if its overlay is missing the client node.
+
+        Returns a note for the caller's result map, or ``None`` when the
+        workspace was already good (the common case — one ``test -x``, so a
+        normal boot pays no measurable cost).
+
+        ``force`` builds regardless, for an operator who knows ``src/`` moved
+        under an already-installed executable.
+        """
+        logger = self._loggers[robot.id]
+        try:
+            conn = await self._get_connection(robot)
+            present = await self._client_executable_present(conn)
+        except Exception as e:
+            logger.error("Workspace check failed: %s", e)
+            self._emit(f"WS-{robot.id}: workspace check FAILED — {e}")
+            return f"workspace check failed — {e}"
+
+        if present and not force:
+            logger.info("Workspace overlay has %s", PIPER_CLIENT_EXECUTABLE)
+            return None
+
+        if not present:
+            stale = (
+                f"workspace overlay is stale — {PIPER_CLIENT_EXECUTABLE} is not "
+                f"installed in {PIPER_WORKSPACE_ROOT}/install"
+            )
+            logger.warning(stale)
+            self._emit(f"WS-{robot.id}: {stale}")
+            if not self.config.auto_build_workspace:
+                return (
+                    f"ERROR: {stale}; auto-build is off — enable docker.auto_build "
+                    "(or ARMORY_AUTO_BUILD_WORKSPACE) or build the workspace by hand"
+                )
+
+        return await self._build_workspace(robot, conn)
+
+    async def _build_workspace(
+        self,
+        robot: Robot,
+        conn: asyncssh.SSHClientConnection,
+    ) -> str:
+        """Incrementally build the piper package on one workstation.
+
+        Detached-and-polled rather than a single long ``conn.run``: a colcon
+        build outlives any sane SSH timeout, and a dropped connection midway
+        through would leave a half-written install/ tree for the whole lab.
+
+        Never ``rm -rf build install`` the way the lab's own entrypoint.sh does
+        (commented out there) — that would delete the overlay out from under
+        every other workstation's running client.
+        """
+        logger = self._loggers[robot.id]
+        log_path = os.path.join(self.config.log_dir, "piper_build.log")
+        log_path_q = shlex.quote(log_path)
+        log_dir_q = shlex.quote(os.path.dirname(log_path))
+        status_q = shlex.quote(PIPER_BUILD_STATUS_PATH)
+
+        # Lock acquisition is kept separate from the build so a contended lock
+        # (another operator's TUI) is distinguishable from a compile error —
+        # `flock <file> <cmd>` collapses both into exit 1.
+        #
+        # --symlink-install so a later edit to an existing node needs no rebuild
+        # at all; only adding an entry point (the case that broke) does.
+        container_script = (
+            f"source {ROS_UNDERLAY_SETUP} || exit 1; "
+            f"cd {shlex.quote(PIPER_WORKSPACE_ROOT)} || exit 1; "
+            f"exec 9>{shlex.quote(PIPER_BUILD_LOCK)} || exit 1; "
+            f"flock -w {int(BUILD_LOCK_WAIT_SEC)} 9 || exit {BUILD_LOCK_BUSY_STATUS}; "
+            f"colcon build --packages-select {PIPER_PACKAGE} --symlink-install"
+        )
+        build_cmd = (
+            f"docker exec {DOCKER_CONTAINER} bash -lc "
+            f"{shlex.quote(container_script)} >> {log_path_q} 2>&1; "
+            f"echo $? > {status_q}"
+        )
+        script = (
+            f"mkdir -p {log_dir_q}; "
+            f"touch {log_path_q} || exit 1; "
+            f"rm -f {status_q}; "
+            f"printf '\\n[%s] Building {PIPER_PACKAGE} workspace on WS-{robot.id}\\n' "
+            f"\"$(date '+%F %T')\" >> {log_path_q}; "
+            f"nohup bash -c {shlex.quote(build_cmd)} >/dev/null 2>&1 < /dev/null &"
+        )
+
+        self._emit(
+            f"WS-{robot.id}: building {PIPER_PACKAGE} workspace "
+            f"(shared by the fleet); log {log_path}"
+        )
+        logger.info("Starting workspace build; log %s", log_path)
+        try:
+            await conn.run(self._bash_command(script), timeout=30)
+        except Exception as e:
+            logger.error("Workspace build launch failed: %s", e)
+            self._emit(f"WS-{robot.id}: workspace build launch FAILED — {e}")
+            return f"workspace build failed to launch — {e}"
+
+        # Module-level intervals looked up at call time so tests can shorten them.
+        status = await self._await_build(
+            robot,
+            conn,
+            DEFAULT_BUILD_TIMEOUT_SEC,
+            poll_interval_sec=BUILD_POLL_INTERVAL_SEC,
+            progress_interval_sec=BUILD_PROGRESS_INTERVAL_SEC,
+        )
+        if status is None:
+            msg = (
+                f"workspace build still running after "
+                f"{DEFAULT_BUILD_TIMEOUT_SEC:.0f}s — see {log_path}"
+            )
+            logger.error(msg)
+            self._emit(f"WS-{robot.id}: {msg}")
+            return f"ERROR: {msg}"
+        if status == BUILD_LOCK_BUSY_STATUS:
+            msg = (
+                f"another workspace build already holds {PIPER_BUILD_LOCK} — "
+                "retry once it finishes"
+            )
+            logger.error(msg)
+            self._emit(f"WS-{robot.id}: {msg}")
+            return f"ERROR: {msg}"
+        if status != 0:
+            tail = await self._tail_remote(conn, log_path)
+            logger.error("Workspace build exited %s: %s", status, tail)
+            self._emit(f"WS-{robot.id}: workspace build FAILED (exit {status})")
+            return f"ERROR: workspace build exited {status} — {tail[:200]}"
+
+        if not await self._client_executable_present(conn):
+            msg = (
+                f"workspace build succeeded but {PIPER_CLIENT_EXECUTABLE} is still "
+                f"missing — check setup.py console_scripts in {PIPER_WORKSPACE_ROOT}"
+                f"/src/{PIPER_PACKAGE}"
+            )
+            logger.error(msg)
+            self._emit(f"WS-{robot.id}: {msg}")
+            return f"ERROR: {msg}"
+
+        logger.info("Workspace build complete")
+        self._emit(f"WS-{robot.id}: workspace build complete")
+        return "workspace rebuilt"
+
+    async def _await_build(
+        self,
+        robot: Robot,
+        conn: asyncssh.SSHClientConnection,
+        timeout_sec: float,
+        poll_interval_sec: float = BUILD_POLL_INTERVAL_SEC,
+        progress_interval_sec: float = BUILD_PROGRESS_INTERVAL_SEC,
+    ) -> int | None:
+        """Poll for the build's exit status. ``None`` means it outlasted the cap.
+
+        Emits a progress line periodically: the build blocks boot, so the event
+        stream is the operator's only sign that the TUI has not wedged.
+        """
+        status_q = shlex.quote(PIPER_BUILD_STATUS_PATH)
+        started = time.monotonic()
+        deadline = started + timeout_sec
+        next_progress = started + progress_interval_sec
+
+        while time.monotonic() < deadline:
+            await asyncio.sleep(poll_interval_sec)
+            try:
+                result = await conn.run(f"cat {status_q} 2>/dev/null", timeout=10, check=False)
+                raw = result.stdout.strip()
+            except Exception as e:
+                self._loggers[robot.id].warning("Build poll failed: %s", e)
+                continue
+            if raw:
+                try:
+                    return int(raw)
+                except ValueError:
+                    return 1
+            now = time.monotonic()
+            if now >= next_progress:
+                self._emit(
+                    f"WS-{robot.id}: workspace build running "
+                    f"({now - started:.0f}s elapsed)..."
+                )
+                next_progress = now + progress_interval_sec
+        return None
+
+    async def _tail_remote(
+        self,
+        conn: asyncssh.SSHClientConnection,
+        path: str,
+        lines: int = 20,
+    ) -> str:
+        try:
+            result = await conn.run(
+                f"tail -n {lines} {shlex.quote(path)}", timeout=15, check=False
+            )
+            return result.stdout.strip() or "(no output)"
+        except Exception as e:
+            return f"(could not read {path}: {e})"
 
     async def _shutdown_robots(
         self,

@@ -58,6 +58,11 @@ def _setting(yaml_value, env_var: str, default: str) -> str:
     return os.environ.get(env_var, "").strip() or default
 
 
+def _truthy(value: str) -> bool:
+    """Parse a YAML/env flag. Anything unrecognised reads as false."""
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _generate_name(used: set[str]) -> str:
     while True:
         name = random.choice(_NAMES)
@@ -102,6 +107,13 @@ class FleetConfig:
         docker_cfg = raw.get("docker") or {}
         self.piper_docker_dir = _setting(
             docker_cfg.get("piper_dir"), "ARMORY_PIPER_DOCKER_DIR", ""
+        )
+        # Whether boot may rebuild the piper workspace when its install/ tree is
+        # missing the client executable. Only ever an incremental build of the
+        # one package, and only when the executable is absent — a present
+        # executable is never rebuilt out from under a running fleet.
+        self.auto_build_workspace = _truthy(
+            _setting(docker_cfg.get("auto_build"), "ARMORY_AUTO_BUILD_WORKSPACE", "true")
         )
 
         used_names: set[str] = set()

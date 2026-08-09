@@ -66,6 +66,7 @@ _ENV_VARS = [
     "ARMORY_TUNNEL_SERVER",
     "ARMORY_WEBCAM_RTSP_BASE_URL",
     "ARMORY_PIPER_DOCKER_DIR",
+    "ARMORY_AUTO_BUILD_WORKSPACE",
 ]
 
 
@@ -172,6 +173,50 @@ def test_piper_root_empty_when_unset(tmp_path, clean_env):
 
     assert cfg.piper_docker_dir == ""
     assert cfg.piper_root == ""
+
+
+def test_auto_build_workspace_defaults_on(tmp_path, clean_env):
+    cfg_path = _write_yaml(
+        tmp_path / "fleet.yaml",
+        """
+        workstations:
+          - id: 1
+        """,
+    )
+
+    assert FleetConfig(cfg_path).auto_build_workspace is True
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [("false", False), ("no", False), ("0", False), ("off", False), ("True", True)],
+)
+def test_auto_build_workspace_reads_yaml_flag(tmp_path, clean_env, value, expected):
+    cfg_path = _write_yaml(
+        tmp_path / "fleet.yaml",
+        f"""
+        workstations:
+          - id: 1
+        docker:
+          auto_build: "{value}"
+        """,
+    )
+
+    assert FleetConfig(cfg_path).auto_build_workspace is expected
+
+
+def test_auto_build_workspace_reads_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARMORY_AUTO_BUILD_WORKSPACE", "false")
+
+    cfg_path = _write_yaml(
+        tmp_path / "fleet.yaml",
+        """
+        workstations:
+          - id: 1
+        """,
+    )
+
+    assert FleetConfig(cfg_path).auto_build_workspace is False
 
 
 def test_yaml_value_beats_env(tmp_path, monkeypatch):

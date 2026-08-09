@@ -66,6 +66,14 @@ class FleetDispatcher:
         """Disable first, kill tunnels, then stop Docker containers."""
         return self.fleet.submit(self._shutdown_safely(robots, callback))
 
+    def build_workspace(self, robots: list[Robot], callback: Callable | None = None):
+        """Rebuild the shared piper workspace on one selected workstation.
+
+        Boot rebuilds automatically when the client executable is missing, so
+        this is only needed when ``src/`` changed under an installed executable.
+        """
+        return self.fleet.build_workspace(robots, callback)
+
     def start_tunnel(self, robots: list[Robot], callback: Callable | None = None):
         """Start SSH tunnels on selected workstations, outside Docker."""
         return self.fleet.start_tunnels(robots, callback)

@@ -24,6 +24,10 @@ class _StubController:
         self.calls.append(("boot_robots", list(robots), callback))
         return "future:boot_robots"
 
+    def build_workspace(self, robots, callback=None):
+        self.calls.append(("build_workspace", list(robots), callback))
+        return "future:build_workspace"
+
     def start_tunnels(self, robots, callback=None):
         self.calls.append(("start_tunnels", list(robots), callback))
         return "future:start_tunnels"
@@ -83,6 +87,7 @@ def test_goto_methods_forward_to_run_on_robots(method, command):
     "method, expected_call",
     [
         ("boot", "boot_robots"),
+        ("build_workspace", "build_workspace"),
         ("start_tunnel", "start_tunnels"),
         ("kill_tunnel", "kill_tunnels"),
         ("start_listener", "start_data_listeners"),

@@ -55,6 +55,9 @@ RUNTIME_COMMANDS = [
     ("2", "Disable"),
     ("3", "Goto Init"),
     ("4", "Goto Zero"),
+    # Last: the command grid truncates on short terminals, and this is the
+    # rarest action here — boot rebuilds the workspace on its own.
+    ("B", "Build WS"),
 ]
 
 RUNTIME_KEYS = {key for key, _ in RUNTIME_COMMANDS}
@@ -202,6 +205,12 @@ class Dashboard:
                 "Webcam",
                 self.dispatcher.start_webcam,
                 self.dispatcher.kill_webcam,
+            )
+        elif ch == "B":
+            # Boot already rebuilds when the client executable is missing; this
+            # is for src/ changing under an executable that is still installed.
+            self._broadcast_with_confirm(
+                "Build Workspace", self.dispatcher.build_workspace
             )
         elif ch == "1":
             self._broadcast_with_confirm("Enable", self.dispatcher.enable)
