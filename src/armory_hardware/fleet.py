@@ -38,6 +38,28 @@ DEFAULT_EPISODE_SUBDIR = "armory_episodes"
 BARRIER_READY_FLAG = "/tmp/armory_ready.flag"
 BARRIER_GO_FLAG = "/tmp/armory_go.flag"
 
+# Boot (see _boot_script). The whole sequence is one remote script, so its steps
+# report back as marker lines on stdout instead of as separate SSH round trips.
+BOOT_ENTRYPOINT = "/CS4803ARM_Lab/user_data/piper_ros/entrypoint.sh"
+BOOT_WAIT_SEC = 15.0
+BOOT_POLL_INTERVAL_SEC = 0.25
+
+_BOOT_ALREADY = "@@ALREADY_RUNNING"
+_BOOT_STARTING = "@@STARTING"
+_BOOT_NOT_UP = "@@NOT_UP"
+_BOOT_NO_PIPER_ROS = "@@NO_PIPER_ROS"
+_BOOT_ENTRYPOINT = "@@ENTRYPOINT"
+_BOOT_OK = "@@BOOTED"
+
+# Markers worth replaying to the operator, phrased in past tense: the script is
+# one round trip, so these describe what already happened rather than narrating
+# it live. The rest are decided on by _boot_single and reported as an outcome.
+_BOOT_PROGRESS = {
+    _BOOT_ALREADY: "container already running — skipped boot",
+    _BOOT_STARTING: "no container found; ran docker run",
+    _BOOT_ENTRYPOINT: "container up; launched entrypoint",
+}
+
 # The lab image defines `p` only as an alias, appended to the container's
 # ~/.bashrc *below* the stock "if not running interactively, don't do anything"
 # guard. Aliases also don't expand in non-interactive shells. Both facts used to
@@ -75,6 +97,11 @@ ROS_UNDERLAY_SETUP = "/opt/ros/humble/setup.bash"
 # NFSv4 is advisory and not perfectly reliable, so the single-builder election
 # in _boot_robots is what actually prevents concurrent builds.
 PIPER_BUILD_LOCK = f"{PIPER_WORKSPACE_ROOT}/.armory_build.lock"
+# colcon's build space for the package. Its symlinked setup.py is the marker
+# colcon reads as "this was last built with --symlink-install" — see
+# _build_workspace for why the build clears it.
+PIPER_BUILD_DIR = f"{PIPER_WORKSPACE_ROOT}/build/{PIPER_PACKAGE}"
+PIPER_DEVELOP_MARKER = f"{PIPER_BUILD_DIR}/setup.py"
 # Exit status of the last build, on the workstation host that ran it.
 PIPER_BUILD_STATUS_PATH = "/tmp/armory_workspace_build.status"
 DEFAULT_BUILD_TIMEOUT_SEC = 900.0
@@ -135,7 +162,10 @@ class FleetController:
         self.logger = logger or logging.getLogger("armory_hardware")
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._connections: dict[int, asyncssh.SSHClientConnection] = {}
+        # robot.id -> Task producing that robot's connection. Storing the task
+        # rather than the connection is what lets N robots dial concurrently:
+        # see _get_connection for why the lock can't wrap the connect itself.
+        self._connections: dict[int, asyncio.Task] = {}
         self._lock = asyncio.Lock()
         # Per-robot cache of the resolved host-side user_data path
         # (echo $PIPER_DOCKER_DIR/../user_data). Populated lazily on first fetch.
@@ -331,37 +361,88 @@ class FleetController:
     # ── internal async methods ──────────────────────────────────
 
     async def _get_connection(self, robot: Robot) -> asyncssh.SSHClientConnection:
-        async with self._lock:
-            conn = self._connections.get(robot.id)
-            if conn is not None:
-                # Check if still alive
-                try:
-                    await conn.run("true", timeout=3)
-                    return conn
-                except Exception:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-                    del self._connections[robot.id]
+        """Return a live SSH connection to ``robot``, dialling if necessary.
 
-            conn = await asyncssh.connect(
-                robot.ip,
-                username=self.config.ssh_user,
-                known_hosts=None,
-                connect_timeout=8,
-            )
-            self._connections[robot.id] = conn
-            return conn
+        The lock is held only long enough to publish an in-flight connect task,
+        never across the connect itself. That distinction is the whole point:
+        every fan-out method here gathers one coroutine per robot, and each of
+        those calls this first — so a lock spanning ``asyncssh.connect`` would
+        quietly serialise all N handshakes and make the gathers decorative.
+        Concurrent callers for the *same* robot still share one task, so a
+        fleet-wide command opens exactly one session per workstation.
+
+        Liveness is a local ``is_closed()`` check rather than a probe command.
+        A probe cost a full round trip on every call and still raced: a
+        connection can die between the probe and the real command, so callers
+        have to handle that failure anyway.
+        """
+        for _attempt in range(2):
+            async with self._lock:
+                task = self._connections.get(robot.id)
+                if task is None:
+                    task = asyncio.ensure_future(self._connect(robot))
+                    self._connections[robot.id] = task
+
+            try:
+                # Shielded so one cancelled caller doesn't tear down the
+                # connect that its peers are also waiting on.
+                conn = await asyncio.shield(task)
+            except Exception:
+                await self._forget_connection(robot.id, task)
+                raise
+
+            if not conn.is_closed():
+                return conn
+            # Cached session has since dropped — discard and dial once more.
+            await self._forget_connection(robot.id, task)
+
+        raise ConnectionError(f"WS-{robot.id}: SSH connection to {robot.ip} keeps closing")
+
+    async def _connect(self, robot: Robot) -> asyncssh.SSHClientConnection:
+        return await asyncssh.connect(
+            robot.ip,
+            username=self.config.ssh_user,
+            known_hosts=None,
+            connect_timeout=8,
+        )
+
+    async def _forget_connection(
+        self,
+        robot_id: int,
+        task: asyncio.Task | None = None,
+    ) -> None:
+        """Drop a robot's cached connection so the next call redials.
+
+        ``task`` guards against evicting a *replacement* connection opened by a
+        concurrent caller after this one already failed.
+        """
+        async with self._lock:
+            current = self._connections.get(robot_id)
+            if current is None or (task is not None and current is not task):
+                return
+            del self._connections[robot_id]
+
+        if current.done() and not current.cancelled():
+            try:
+                current.result().close()
+            except Exception:
+                pass
 
     async def _close_all(self):
         async with self._lock:
-            for _rid, conn in self._connections.items():
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            tasks = list(self._connections.values())
             self._connections.clear()
+
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+                continue
+            if task.cancelled():
+                continue
+            try:
+                task.result().close()
+            except Exception:
+                pass
 
     async def _check_status(self, robot: Robot) -> RobotStatus:
         logger = self._loggers[robot.id]
@@ -382,8 +463,7 @@ class FleetController:
         except Exception as e:
             logger.error("Status check failed: %s", e)
             self._emit(f"WS-{robot.id}: unreachable — {e}")
-            async with self._lock:
-                self._connections.pop(robot.id, None)
+            await self._forget_connection(robot.id)
             return RobotStatus.OFFLINE
 
     async def _check_all_status(self, callback: Callable | None = None):
@@ -488,90 +568,111 @@ class FleetController:
             )
         return root
 
+    def _boot_script(self, piper_root: str) -> str:
+        """One-shot boot: check, clean, run, wait for up, verify, entrypoint.
+
+        Written as a single remote script rather than the six ``conn.run``
+        calls it replaces. Each of those was a full round trip that the next
+        step's outcome depended on, so a 14-workstation boot paid 6×RTT×14 in
+        latency alone — and the fixed ``sleep 2`` between ``docker run`` and the
+        liveness check was charged whether the container took 200ms or didn't
+        come up at all.
+
+        Progress is reported by marker lines on stdout (``@@`` prefixed) that
+        ``_boot_single`` maps back to operator-facing events, so collapsing the
+        round trips doesn't collapse the log detail.
+        """
+        # piper_start uses `docker run -it` which blocks and needs a TTY.
+        # Instead, run in detached mode (-d) with --entrypoint overridden to
+        # `sleep` so the container stays alive, then launch the real entrypoint
+        # via docker exec.
+        #
+        # The lab paths are interpolated from config rather than expanded by the
+        # remote shell. --mount (not -v) is used for them so Docker rejects a
+        # source that does not exist instead of helpfully creating an empty
+        # root-owned directory and booting a container with nothing in it.
+        # $DISPLAY stays shell-expanded — it is genuinely per-session, and the
+        # inner `bash -lc` this script runs under still expands it.
+        run_cmd = (
+            "docker run -d"
+            " --privileged --net=host --runtime=nvidia --gpus all"
+            f" --name {DOCKER_CONTAINER}"
+            " --entrypoint sleep"
+            " -e NVIDIA_DRIVER_CAPABILITIES=all"
+            " -e DISPLAY=$DISPLAY"
+            " -v /tmp/.X11-unix/:/tmp/.X11-unix/:rw"
+            f" --mount type=bind,source={piper_root}/user_data,target=/CS4803ARM_Lab/user_data"
+            f" --mount type=bind,source={piper_root}/assets,target=/CS4803ARM_Lab/assets"
+            f" --mount type=bind,source={piper_root}/user_data/piper_ros,target=/piper_ros"
+            " -v /home/data_collection/dhe83/:/datasets/"
+            " -v /dev:/dev"
+            " -w /CS4803ARM_Lab/user_data/data_collection"
+            " firefall/cluster_piper_env:v2"
+            " infinity"
+        )
+        running = f"docker ps --filter name={DOCKER_CONTAINER} -q | grep -q ."
+        deadline = int(BOOT_WAIT_SEC / BOOT_POLL_INTERVAL_SEC)
+
+        return (
+            f"if {running}; then echo '{_BOOT_ALREADY}'; exit 0; fi; "
+            f"docker rm -f {DOCKER_CONTAINER} >/dev/null 2>&1 || true; "
+            f"echo '{_BOOT_STARTING}'; "
+            f"{run_cmd} || {{ echo '{_BOOT_NOT_UP}'; exit 1; }}; "
+            # Poll instead of sleeping a flat interval: a healthy container is
+            # usually up in well under a second.
+            f"i=0; while [ $i -lt {deadline} ]; do "
+            f"  if {running}; then break; fi; "
+            f"  sleep {BOOT_POLL_INTERVAL_SEC}; i=$((i+1)); "
+            "done; "
+            f"if ! {running}; then echo '{_BOOT_NOT_UP}'; exit 1; fi; "
+            # A container whose /piper_ros is empty starts fine and fails later
+            # on the first `p` command. Catch it here, while the cause is still
+            # in view.
+            f"if ! docker exec {DOCKER_CONTAINER} test -f {PIPER_ROS_SETUP}; then "
+            f"  echo '{_BOOT_NO_PIPER_ROS}'; exit 1; "
+            "fi; "
+            f"echo '{_BOOT_ENTRYPOINT}'; "
+            f"docker exec -d {DOCKER_CONTAINER} bash -c {shlex.quote(BOOT_ENTRYPOINT)}; "
+            f"echo '{_BOOT_OK}'"
+        )
+
     async def _boot_single(self, robot: Robot) -> str:
         logger = self._loggers[robot.id]
         try:
             conn = await self._get_connection(robot)
+            piper_root = self._require_piper_root(robot)
 
-            # Check if already running
-            check = await conn.run(
-                f"docker ps --filter name={DOCKER_CONTAINER} -q",
-                timeout=10,
+            logger.info("Booting Docker container")
+            self._emit(f"WS-{robot.id}: booting Docker container...")
+            result = await conn.run(
+                self._bash_command(self._boot_script(piper_root)),
+                timeout=BOOT_WAIT_SEC + 60,
+                check=False,
             )
-            if check.stdout.strip():
+
+            markers = []
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("@@"):
+                    markers.append(line)
+                elif line:
+                    logger.info("boot output: %s", line)
+            for marker in markers:
+                note = _BOOT_PROGRESS.get(marker)
+                if note:
+                    self._emit(f"WS-{robot.id}: {note}")
+
+            stderr = result.stderr.strip()
+            if stderr:
+                logger.warning("boot stderr: %s", stderr)
+
+            if _BOOT_ALREADY in markers:
                 msg = "Container already running — skipping boot"
                 logger.info(msg)
-                self._emit(f"WS-{robot.id}: {msg}")
                 robot.status = RobotStatus.BOOTED
                 return msg
 
-            # Remove any exited container with the same name
-            await conn.run(
-                f"docker rm -f {DOCKER_CONTAINER} 2>/dev/null || true",
-                timeout=10,
-            )
-
-            logger.info("Starting Docker container in detached mode")
-            self._emit(f"WS-{robot.id}: starting Docker container...")
-
-            piper_root = self._require_piper_root(robot)
-
-            # piper_start uses `docker run -it` which blocks and needs a TTY.
-            # Instead, run in detached mode (-d) with --entrypoint overridden
-            # to `sleep` so the container stays alive, then launch the real
-            # entrypoint via docker exec.
-            #
-            # The lab paths are interpolated from config rather than expanded by
-            # the remote shell. --mount (not -v) is used for them so Docker
-            # rejects a source that does not exist instead of helpfully creating
-            # an empty root-owned directory and booting a container with nothing
-            # in it. $DISPLAY stays shell-expanded — it is genuinely per-session.
-            boot_cmd = (
-                "bash -lc 'docker run -d"
-                " --privileged --net=host --runtime=nvidia --gpus all"
-                f" --name {DOCKER_CONTAINER}"
-                " --entrypoint sleep"
-                " -e NVIDIA_DRIVER_CAPABILITIES=all"
-                ' -e DISPLAY=$DISPLAY'
-                " -v /tmp/.X11-unix/:/tmp/.X11-unix/:rw"
-                f" --mount type=bind,source={piper_root}/user_data,target=/CS4803ARM_Lab/user_data"
-                f" --mount type=bind,source={piper_root}/assets,target=/CS4803ARM_Lab/assets"
-                f" --mount type=bind,source={piper_root}/user_data/piper_ros,target=/piper_ros"
-                " -v /home/data_collection/dhe83/:/datasets/"
-                " -v /dev:/dev"
-                " -w /CS4803ARM_Lab/user_data/data_collection"
-                " firefall/cluster_piper_env:v2"
-                " infinity'"
-            )
-            result = await conn.run(boot_cmd, timeout=30)
-            stdout = result.stdout.strip()
-            stderr = result.stderr.strip()
-            if stdout:
-                logger.info("docker run output: %s", stdout)
-                self._emit(f"WS-{robot.id}: {stdout[:80]}")
-            if stderr:
-                logger.warning("docker run stderr: %s", stderr)
-                self._emit(f"WS-{robot.id}: {stderr[:80]}")
-
-            # Verify container came up
-            await asyncio.sleep(2)
-            check = await conn.run(
-                f"docker ps --filter name={DOCKER_CONTAINER} -q",
-                timeout=10,
-            )
-            if not check.stdout.strip():
-                logger.warning("Container failed to start")
-                self._emit(f"WS-{robot.id}: container failed to start")
-                return "Boot failed — container not detected after docker run"
-
-            # A container whose /piper_ros is empty starts fine and fails later on
-            # the first `p` command. Catch it here, while the cause is still in view.
-            probe = await conn.run(
-                f"docker exec {DOCKER_CONTAINER} test -f {PIPER_ROS_SETUP}",
-                timeout=10,
-                check=False,
-            )
-            if probe.exit_status != 0:
+            if _BOOT_NO_PIPER_ROS in markers:
                 msg = (
                     f"container is up but {PIPER_ROS_SETUP} is missing — "
                     f"check that {piper_root}/user_data/piper_ros is populated"
@@ -580,13 +681,11 @@ class FleetController:
                 self._emit(f"WS-{robot.id}: {msg}")
                 return f"ERROR: {msg}"
 
-            # Run the entrypoint inside the container
-            self._emit(f"WS-{robot.id}: container up, running entrypoint...")
-            entrypoint = "/CS4803ARM_Lab/user_data/piper_ros/entrypoint.sh"
-            await conn.run(
-                f"docker exec -d {DOCKER_CONTAINER} bash -c '{entrypoint}'",
-                timeout=15,
-            )
+            if _BOOT_OK not in markers:
+                detail = stderr or "container not detected after docker run"
+                logger.warning("Container failed to start: %s", detail)
+                self._emit(f"WS-{robot.id}: container failed to start")
+                return f"Boot failed — {detail}"
 
             logger.info("Container started successfully")
             self._emit(f"WS-{robot.id}: boot successful")
@@ -705,14 +804,36 @@ class FleetController:
         # (another operator's TUI) is distinguishable from a compile error —
         # `flock <file> <cmd>` collapses both into exit 1.
         #
-        # --symlink-install so a later edit to an existing node needs no rebuild
-        # at all; only adding an entry point (the case that broke) does.
+        # A plain copy install, deliberately not --symlink-install. For an
+        # ament_python package colcon implements the symlink variant as
+        # `setup.py develop --editable`, and the lab image carries setuptools
+        # 80, which dropped the develop command's easy_install-derived options
+        # outright — so it fails with "option --editable not recognized" before
+        # compiling anything. The existing install/ tree holds real .py copies
+        # rather than symlinks, so a copy install is also what it was built
+        # with. Cost of the difference: editing an *existing* node now needs a
+        # rebuild too, where a symlink overlay would have picked it up for free.
+        # That is what `[B] Build WS` is for.
+        # Clearing the develop marker is what makes the copy install possible at
+        # all. colcon treats "<build space>/setup.py is a symlink, and
+        # <pkg>.egg-info sits beside it" as "the last build was
+        # --symlink-install", and tries to undo it with
+        # `setup.py develop --uninstall --editable` — options setuptools 80
+        # dropped along with --editable, so the build dies on the *previous*
+        # build's leftovers rather than on anything in src/. colcon removes this
+        # symlink itself after a successful develop build; a failed one leaves it
+        # behind, which is exactly the state a half-finished symlink build (or an
+        # older version of this code) hands us. Only the regenerable build space
+        # is touched — never install/, which is the overlay the running clients
+        # on every other workstation are reading.
+        marker_q = shlex.quote(PIPER_DEVELOP_MARKER)
         container_script = (
             f"source {ROS_UNDERLAY_SETUP} || exit 1; "
             f"cd {shlex.quote(PIPER_WORKSPACE_ROOT)} || exit 1; "
             f"exec 9>{shlex.quote(PIPER_BUILD_LOCK)} || exit 1; "
             f"flock -w {int(BUILD_LOCK_WAIT_SEC)} 9 || exit {BUILD_LOCK_BUSY_STATUS}; "
-            f"colcon build --packages-select {PIPER_PACKAGE} --symlink-install"
+            f"if [ -L {marker_q} ]; then rm -f {marker_q}; fi; "
+            f"colcon build --packages-select {PIPER_PACKAGE}"
         )
         build_cmd = (
             f"docker exec {DOCKER_CONTAINER} bash -lc "
@@ -767,8 +888,17 @@ class FleetController:
         if status != 0:
             tail = await self._tail_remote(conn, log_path)
             logger.error("Workspace build exited %s: %s", status, tail)
-            self._emit(f"WS-{robot.id}: workspace build FAILED (exit {status})")
-            return f"ERROR: workspace build exited {status} — {tail[:200]}"
+            self._emit(
+                f"WS-{robot.id}: workspace build FAILED (exit {status}); see {log_path}"
+            )
+            # The *end* of the tail, not the start. colcon prints the reason a
+            # build failed last, under a "--- stderr" banner and below its own
+            # progress chatter, so truncating from the front reliably discards
+            # the one line the operator needs.
+            excerpt = tail[-300:]
+            if len(tail) > 300:
+                excerpt = f"...{excerpt}"
+            return f"ERROR: workspace build exited {status}; see {log_path} — {excerpt}"
 
         if not await self._client_executable_present(conn):
             msg = (
@@ -1300,13 +1430,20 @@ class FleetController:
         results = {}
         connections = []
 
-        # Warm connections first, then launch the long-running commands together.
-        for robot in robots:
-            try:
-                connections.append((robot, await self._get_connection(robot)))
-            except Exception as e:
-                self._emit(f"WS-{robot.id}: {label} launch FAILED — {e}")
-                results[robot.id] = f"ERROR: {e}"
+        # Warm every connection at once, then launch the long-running commands
+        # together. Warming still happens up front (a robot we can't reach
+        # should fail before any of its peers are launched), but the warming
+        # itself has no reason to be sequential.
+        conns = await asyncio.gather(
+            *(self._get_connection(robot) for robot in robots),
+            return_exceptions=True,
+        )
+        for robot, conn in zip(robots, conns):
+            if isinstance(conn, BaseException):
+                self._emit(f"WS-{robot.id}: {label} launch FAILED — {conn}")
+                results[robot.id] = f"ERROR: {conn}"
+            else:
+                connections.append((robot, conn))
 
         tasks = [
             self._start_detached_docker_process(

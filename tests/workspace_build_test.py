@@ -99,10 +99,34 @@ def test_missing_executable_triggers_build(controller):
     assert conn.build_launched
     build = next(c for c in conn.commands if "colcon build" in c)
     assert f"--packages-select {fleet_mod.PIPER_PACKAGE}" in build
-    assert "--symlink-install" in build
+    # Not --symlink-install: colcon implements it for ament_python as
+    # `setup.py develop --editable`, which setuptools 80 (the lab image's
+    # version) rejects outright — the build fails before compiling anything.
+    assert "--symlink-install" not in build
     # Never the entrypoint's clean build — it would delete the overlay out from
     # under every other workstation's running client.
     assert "rm -rf" not in build
+
+
+def test_build_clears_stale_develop_marker(controller):
+    """A leftover symlinked setup.py in the build space breaks the copy install.
+
+    colcon reads it as "last built with --symlink-install" and tries to undo
+    that with `develop --uninstall --editable`, which setuptools 80 rejects —
+    so the build fails on the previous build's debris, not on anything in src/.
+    """
+    conn = _attach(controller, _FakeConnection(executable_present=False))
+
+    asyncio.run(controller._ensure_workspace_built(_robot()))
+
+    build = next(c for c in conn.commands if "colcon build" in c)
+    assert f"[ -L {fleet_mod.PIPER_DEVELOP_MARKER} ]" in build
+    # Cleared before colcon runs, or colcon has already read it.
+    assert build.index(fleet_mod.PIPER_DEVELOP_MARKER) < build.index("colcon build")
+    # Only the regenerable build space — never install/, the overlay every
+    # other workstation's running client reads.
+    assert fleet_mod.PIPER_DEVELOP_MARKER.startswith(fleet_mod.PIPER_BUILD_DIR)
+    assert f"{fleet_mod.PIPER_WORKSPACE_ROOT}/install" not in build
 
 
 def test_build_is_serialized_by_flock(controller):
