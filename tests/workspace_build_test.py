@@ -8,6 +8,7 @@ and a missing one is built exactly once, on one machine.
 from __future__ import annotations
 
 import asyncio
+import re
 from textwrap import dedent
 
 import pytest
@@ -104,8 +105,29 @@ def test_missing_executable_triggers_build(controller):
     # version) rejects outright — the build fails before compiling anything.
     assert "--symlink-install" not in build
     # Never the entrypoint's clean build — it would delete the overlay out from
-    # under every other workstation's running client.
-    assert "rm -rf" not in build
+    # under every other workstation's running client. Derived state under
+    # build/ is fair game; install/ is not.
+    assert f"rm -rf {fleet_mod.PIPER_WORKSPACE_ROOT}/install" not in build
+    for deleted in re.findall(r"rm -rf (\S+)", build):
+        assert deleted.startswith(fleet_mod.PIPER_BUILD_DIR), deleted
+
+
+def test_build_discards_stale_staging_tree(controller):
+    """A copy install reinstalls stale staged files unless staging is dropped.
+
+    setuptools' build_py refreshes build/<pkg>/build/lib only when src is
+    *newer*, which a shared NFS checkout cannot guarantee — so a build can
+    reinstall an old node and still report success.
+    """
+    conn = _attach(controller, _FakeConnection(executable_present=False))
+
+    asyncio.run(controller._ensure_workspace_built(_robot()))
+
+    build = next(c for c in conn.commands if "colcon build" in c)
+    assert f"rm -rf {fleet_mod.PIPER_STAGING_DIR}" in build
+    assert build.index(fleet_mod.PIPER_STAGING_DIR) < build.index("colcon build")
+    # Derived state only — install/ is the overlay other workstations read.
+    assert fleet_mod.PIPER_STAGING_DIR.startswith(fleet_mod.PIPER_BUILD_DIR)
 
 
 def test_build_clears_stale_develop_marker(controller):

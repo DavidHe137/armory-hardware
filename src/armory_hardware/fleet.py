@@ -41,6 +41,15 @@ BARRIER_GO_FLAG = "/tmp/armory_go.flag"
 # Boot (see _boot_script). The whole sequence is one remote script, so its steps
 # report back as marker lines on stdout instead of as separate SSH round trips.
 BOOT_ENTRYPOINT = "/CS4803ARM_Lab/user_data/piper_ros/entrypoint.sh"
+# armory_client, as the container sees it. The lab image pip-installs it
+# editable, but records the pre-restructure layout
+# (armory/packages/armory-client/src), so `import armory_client` fails outright
+# and takes the client node down on its import line. Putting the real location
+# on PYTHONPATH at `docker run` is what makes it reachable: the image's stale
+# .pth cannot be fixed from here, and entrypoint.sh cannot do it either — boot
+# runs that as a one-shot `docker exec`, so its exports never reach the separate
+# exec that launches the client. Container env does reach every exec.
+ARMORY_CLIENT_SRC = "/CS4803ARM_Lab/user_data/armory/armory-client/src"
 BOOT_WAIT_SEC = 15.0
 BOOT_POLL_INTERVAL_SEC = 0.25
 
@@ -102,6 +111,9 @@ PIPER_BUILD_LOCK = f"{PIPER_WORKSPACE_ROOT}/.armory_build.lock"
 # _build_workspace for why the build clears it.
 PIPER_BUILD_DIR = f"{PIPER_WORKSPACE_ROOT}/build/{PIPER_PACKAGE}"
 PIPER_DEVELOP_MARKER = f"{PIPER_BUILD_DIR}/setup.py"
+# setuptools' build_py staging tree. Copied from, not into, install/ — see
+# _build_workspace for why a copy install has to discard it first.
+PIPER_STAGING_DIR = f"{PIPER_BUILD_DIR}/build"
 # Exit status of the last build, on the workstation host that ran it.
 PIPER_BUILD_STATUS_PATH = "/tmp/armory_workspace_build.status"
 DEFAULT_BUILD_TIMEOUT_SEC = 900.0
@@ -600,6 +612,7 @@ class FleetController:
             " --entrypoint sleep"
             " -e NVIDIA_DRIVER_CAPABILITIES=all"
             " -e DISPLAY=$DISPLAY"
+            f" -e PYTHONPATH={ARMORY_CLIENT_SRC}"
             " -v /tmp/.X11-unix/:/tmp/.X11-unix/:rw"
             f" --mount type=bind,source={piper_root}/user_data,target=/CS4803ARM_Lab/user_data"
             f" --mount type=bind,source={piper_root}/assets,target=/CS4803ARM_Lab/assets"
@@ -814,25 +827,36 @@ class FleetController:
         # with. Cost of the difference: editing an *existing* node now needs a
         # rebuild too, where a symlink overlay would have picked it up for free.
         # That is what `[B] Build WS` is for.
-        # Clearing the develop marker is what makes the copy install possible at
-        # all. colcon treats "<build space>/setup.py is a symlink, and
-        # <pkg>.egg-info sits beside it" as "the last build was
-        # --symlink-install", and tries to undo it with
-        # `setup.py develop --uninstall --editable` — options setuptools 80
-        # dropped along with --editable, so the build dies on the *previous*
-        # build's leftovers rather than on anything in src/. colcon removes this
-        # symlink itself after a successful develop build; a failed one leaves it
-        # behind, which is exactly the state a half-finished symlink build (or an
-        # older version of this code) hands us. Only the regenerable build space
-        # is touched — never install/, which is the overlay the running clients
-        # on every other workstation are reading.
+        # Two pieces of leftover build state have to go first. Both live under
+        # the build space, which is pure derived state — never install/, the
+        # overlay every other workstation's running client is reading.
+        #
+        # The develop marker, or colcon will not get as far as compiling. It
+        # treats "<build space>/setup.py is a symlink, with <pkg>.egg-info
+        # beside it" as "the last build was --symlink-install" and tries to undo
+        # that with `setup.py develop --uninstall --editable` — options
+        # setuptools 80 dropped along with --editable. colcon removes the
+        # symlink itself after a *successful* develop build; a failed one leaves
+        # it behind, which is precisely what a half-finished symlink build (or
+        # an older version of this code) hands us.
+        #
+        # The staging tree, or the build compiles and still installs the wrong
+        # thing. A copy install goes src/ -> build/<pkg>/build/lib -> install/,
+        # and setuptools' build_py refreshes that middle step only when the
+        # source file is *newer* than the staged one. On a shared NFS checkout
+        # that does not hold — a pull can land a file whose mtime predates the
+        # staged copy, and the build then reinstalls the stale staged version
+        # and reports success. Not hypothetical: it is how install/ came to hold
+        # a client node written against a previous armory_client API.
         marker_q = shlex.quote(PIPER_DEVELOP_MARKER)
+        staging_q = shlex.quote(PIPER_STAGING_DIR)
         container_script = (
             f"source {ROS_UNDERLAY_SETUP} || exit 1; "
             f"cd {shlex.quote(PIPER_WORKSPACE_ROOT)} || exit 1; "
             f"exec 9>{shlex.quote(PIPER_BUILD_LOCK)} || exit 1; "
             f"flock -w {int(BUILD_LOCK_WAIT_SEC)} 9 || exit {BUILD_LOCK_BUSY_STATUS}; "
             f"if [ -L {marker_q} ]; then rm -f {marker_q}; fi; "
+            f"rm -rf {staging_q}; "
             f"colcon build --packages-select {PIPER_PACKAGE}"
         )
         build_cmd = (
