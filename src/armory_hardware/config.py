@@ -99,6 +99,18 @@ class FleetConfig:
             webcam_cfg.get("rtsp_base_url"), "ARMORY_WEBCAM_RTSP_BASE_URL", ""
         )
 
+        # Policy server the client node opens its websocket to. The node's own
+        # default is localhost, which only resolves if something is forwarding
+        # that port -- i.e. the SSH tunnel. Naming the server directly skips the
+        # tunnel (and its two-hop key setup) whenever the workstations can route
+        # to it, which on this fleet they can. Empty host leaves the node's
+        # built-in default alone, so the tunnel path still works unchanged.
+        policy_cfg = raw.get("policy") or {}
+        self.policy_host = _setting(policy_cfg.get("host"), "ARMORY_POLICY_HOST", "")
+        self.policy_port = int(
+            _setting(policy_cfg.get("port"), "ARMORY_POLICY_PORT", "8080")
+        )
+
         # Workstation-side lab checkout. Named after the workstation's own
         # PIPER_DOCKER_DIR, but read from here rather than the workstation's
         # ~/.bashrc: that file only defines the variable for interactive shells,

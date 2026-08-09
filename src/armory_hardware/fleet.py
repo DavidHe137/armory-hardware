@@ -1291,6 +1291,30 @@ class FleetController:
             callback=callback,
         )
 
+    def _policy_ros_args(self) -> str:
+        """``--ros-args`` overriding the client node's policy endpoint.
+
+        The node declares ``host``/``port`` as ROS parameters defaulting to
+        ``localhost:8080``, which only resolves when the SSH tunnel is
+        forwarding that port. Pointing the parameters straight at the policy
+        server removes the tunnel from the path entirely.
+
+        ``rclpy`` merges command-line parameter overrides with the explicit
+        ``parameter_overrides`` the node's ``main`` builds from its own flags,
+        and that list never contains ``host``/``port`` — so this cannot collide
+        with ``--prompt``/``--control-hz``/``--barrier``.
+
+        Empty when no host is configured, which leaves the node's built-in
+        default (and therefore the tunnel workflow) untouched.
+        """
+        host = self.config.policy_host.strip()
+        if not host:
+            return ""
+        return (
+            f"--ros-args -p host:={shlex.quote(host)} "
+            f"-p port:={int(self.config.policy_port)}"
+        )
+
     async def _start_clients(
         self,
         robots: list[Robot],
@@ -1305,6 +1329,7 @@ class FleetController:
             log_suffix="client",
             callback=callback,
             extra_args_per_robot=extra_args_per_robot,
+            trailing_args=self._policy_ros_args(),
         )
 
     async def _kill_data_listeners(
@@ -1450,6 +1475,7 @@ class FleetController:
         log_suffix: str,
         callback: Callable | None = None,
         extra_args_per_robot: dict[int, str] | None = None,
+        trailing_args: str = "",
     ):
         results = {}
         connections = []
@@ -1474,7 +1500,9 @@ class FleetController:
                 robot,
                 conn,
                 label,
-                self._command_for_robot(command, robot, extra_args_per_robot),
+                self._command_for_robot(
+                    command, robot, extra_args_per_robot, trailing_args
+                ),
                 cwd,
                 log_suffix,
             )
@@ -1493,17 +1521,28 @@ class FleetController:
         base_command: str,
         robot: Robot,
         extra_args_per_robot: dict[int, str] | None,
+        trailing_args: str = "",
     ) -> str:
         """Append per-robot args to the base command. Kill matching uses the
         base command as a substring pattern, so any suffix here is invisible
         to ``_kill_detached_docker_process`` — start/kill stay symmetric.
+
+        ``trailing_args`` lands after the per-robot args, which is what makes it
+        safe to put a ``--ros-args`` block there: rclpy consumes everything from
+        ``--ros-args`` to the end of argv (or to a ``--``), so anything appended
+        behind it would be swallowed as a ROS argument instead of reaching the
+        node's own argparse. Dispatcher args open with their own ``--``
+        separator and must therefore come first.
         """
-        if not extra_args_per_robot:
+        parts = [base_command]
+        extra = (extra_args_per_robot or {}).get(robot.id)
+        if extra:
+            parts.append(extra.strip())
+        if trailing_args:
+            parts.append(trailing_args.strip())
+        resolved = " ".join(p for p in parts if p).rstrip()
+        if resolved == base_command:
             return base_command
-        extra = extra_args_per_robot.get(robot.id)
-        if not extra:
-            return base_command
-        resolved = f"{base_command} {extra}".rstrip()
         # Surface the resolved per-robot command so you can verify the override
         # actually reached the SSH layer without tailing each workstation log.
         self.logger.info("WS-%s: resolved launch command: %s", robot.id, resolved)
