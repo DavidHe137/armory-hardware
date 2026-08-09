@@ -790,7 +790,17 @@ class FleetController:
                     "(or ARMORY_AUTO_BUILD_WORKSPACE) or build the workspace by hand"
                 )
 
-        return await self._build_workspace(robot, conn)
+        try:
+            return await self._build_workspace(robot, conn)
+        except Exception as e:
+            # Report as a result, never as an exception. Both callers reach
+            # their ``callback(results)`` only by returning normally, and that
+            # callback is what unlocks the TUI — an SSH timeout escaping from
+            # here (the post-build `test -x` probe is the reachable one) left
+            # the console permanently wedged with nothing in the log.
+            logger.error("Workspace build failed: %s", e)
+            self._emit(f"WS-{robot.id}: workspace build FAILED — {e}")
+            return f"ERROR: workspace build failed — {e}"
 
     async def _build_workspace(
         self,

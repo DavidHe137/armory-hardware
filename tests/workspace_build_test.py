@@ -249,3 +249,49 @@ def test_fleet_build_skips_when_nothing_is_booted(controller):
 
     assert results == {}
     assert not conn.build_launched
+
+
+def test_build_error_is_returned_not_raised(controller):
+    """An escaping exception here used to wedge the TUI permanently.
+
+    ``_boot_robots`` and ``_build_workspace_on_first`` both reach their
+    ``callback(results)`` — the call that unlocks the dashboard — only by
+    returning normally. The post-build ``test -x`` probe is a live SSH round
+    trip that can time out, so this path has to report as a result.
+    """
+
+    class _ExplodingConnection(_FakeConnection):
+        async def run(self, command, timeout=None, check=True):
+            if f"test -x {fleet_mod.PIPER_CLIENT_EXECUTABLE_PATH}" in command:
+                if self.commands:  # the post-build probe, not the initial one
+                    raise TimeoutError("SSH probe timed out")
+                self.commands.append(command)
+                return _Result(exit_status=1)
+            return await super().run(command, timeout=timeout, check=check)
+
+    _attach(controller, _ExplodingConnection(executable_present=False))
+
+    note = asyncio.run(controller._ensure_workspace_built(_robot()))
+
+    assert note.startswith("ERROR:")
+    assert "SSH probe timed out" in note
+
+
+def test_boot_still_calls_back_when_the_build_probe_fails(controller):
+    """Boot's callback is the dashboard's only unlock signal — it must fire."""
+
+    class _ExplodingConnection(_FakeConnection):
+        async def run(self, command, timeout=None, check=True):
+            if "docker ps" in command or "@@" in command:
+                return _Result(stdout=fleet_mod._BOOT_ALREADY)
+            if f"test -x {fleet_mod.PIPER_CLIENT_EXECUTABLE_PATH}" in command:
+                raise TimeoutError("SSH probe timed out")
+            return await super().run(command, timeout=timeout, check=check)
+
+    _attach(controller, _ExplodingConnection(executable_present=False))
+    controller.config.piper_docker_dir = "/lab/docker"
+    seen = {}
+
+    asyncio.run(controller._boot_robots([_robot()], callback=seen.update))
+
+    assert seen, "boot must invoke its callback even when the build probe fails"

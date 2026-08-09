@@ -46,6 +46,11 @@ CORE_COMMANDS = [
     ("Q", "Quit"),
 ]
 
+# [A] Abort is deliberately not in the grid: it only does anything while a
+# command is in flight, and the grid truncates at six entries on a 24-row
+# terminal. It is advertised in the header instead, exactly when it applies.
+KEY_ABORT = "A"
+
 RUNTIME_COMMANDS = [
     ("L", "Listener"),
     ("C", "Client"),
@@ -88,6 +93,14 @@ class Dashboard:
         self._client_status_pending = False
         self._emergency_stop_active = False
         self._active_pane = PANE_FLEET
+        # In-flight command bookkeeping. `_op_token` identifies the operation
+        # that currently owns `_busy`, so a late callback from an operation the
+        # operator already abandoned can't unlock the UI for a newer one.
+        self._op_name = ""
+        self._op_started = 0.0
+        self._op_token = 0
+        self._op_future = None
+        self._op_state: dict | None = None
         # Rows scrolled up from the newest entry; 0 means "follow the tail".
         self._log_scroll = 0
         self._log_rows_total = 0
@@ -111,17 +124,19 @@ class Dashboard:
         stdscr.keypad(True)
 
         self._log("ARMory dashboard started.")
-        self._log("Querying workstation status...")
-
-        self._busy = True
-        self.fleet.check_all_status(callback=self._on_status_done)
+        self._refresh_status("Querying workstation status...")
 
         while True:
             try:
                 self._render()
                 key = stdscr.getch()
                 if key == -1:
-                    curses.napms(100)
+                    # time.sleep, not curses.napms: napms holds the GIL for the
+                    # whole nap, so the fleet's asyncio thread only advanced
+                    # between naps. That capped every SSH round trip at 100ms
+                    # and made the 14-way cold status check on startup blow its
+                    # per-command timeout on all but a workstation or two.
+                    time.sleep(0.1)
                     continue
                 if self._handle_key(key):
                     break
@@ -146,11 +161,17 @@ class Dashboard:
         if self._active_pane == PANE_LOG and self._handle_log_scroll(key, ch):
             return False
 
+        # Abort outranks every busy guard below — it exists precisely for the
+        # case where the operation holding those guards is never going to
+        # finish on its own.
+        if ch == KEY_ABORT:
+            self._abort_operation()
+            return False
+
         if self._emergency_stop_active:
-            now = time.time()
-            if now - self._last_busy_notice > 1.5:
-                self._last_busy_notice = now
-                self._log("Emergency client stop is still running.")
+            self._throttled_busy_log(
+                "Emergency client stop is still running. Press [A] to abort and unlock."
+            )
             return False
 
         if key == curses.KEY_UP or ch == "K":
@@ -167,10 +188,11 @@ class Dashboard:
             return False
 
         if self._busy:
-            now = time.time()
-            if now - self._last_busy_notice > 1.5:
-                self._last_busy_notice = now
-                self._log("Current operation still running. Controls will unlock shortly.")
+            self._throttled_busy_log(
+                f"'{self._op_name or 'Current operation'}' still running "
+                f"({time.time() - self._op_started:.0f}s). "
+                "Press [A] to abort and unlock the dashboard."
+            )
             return False
 
         if ch in RUNTIME_KEYS and not self._runtime_controls_unlocked():
@@ -229,16 +251,168 @@ class Dashboard:
 
         return False
 
+    # ── operation tracking ──────────────────────────────────────
+
+    def _start_operation(
+        self,
+        name: str,
+        launch,
+        start_message: str | None = None,
+        on_results=None,
+    ):
+        """Run a fleet command with a guaranteed unlock.
+
+        Every command used to set ``_busy`` and rely solely on its own callback
+        to clear it. Anything that kept that callback from firing — an
+        exception escaping the fleet coroutine, a submit that never scheduled —
+        locked the operator out of the dashboard permanently, with nothing in
+        the log to say why. Killing a client, refreshing, even shutting down
+        cleanly all became impossible.
+
+        So the submitted future is tracked here as well: the operation unlocks
+        on whichever of the two paths lands first, and ``[A]`` has a handle to
+        cancel when neither does.
+        """
+        with self._lock:
+            self._op_token += 1
+            token = self._op_token
+            state: dict = {"done": False}
+            self._busy = True
+            self._op_name = name
+            self._op_started = time.time()
+            self._op_future = None
+            self._op_state = state
+
+        if start_message:
+            self._log(start_message)
+
+        def finish(results=None, error=None):
+            with self._lock:
+                if state["done"]:
+                    return
+                state["done"] = True
+                # Only the newest operation owns the busy flag. An emergency
+                # stop launched on top of this one must keep the UI locked
+                # until *it* finishes, even if this one lands first.
+                if token == self._op_token:
+                    self._busy = False
+                    self._op_name = ""
+                    self._op_future = None
+                    self._op_state = None
+
+            if error is not None:
+                self._log(f"'{name}' failed: {error}")
+                self._set_notice(f"'{name}' failed — see the Signal Log.")
+            if results:
+                for rid, out in results.items():
+                    self._log(f"  WS-{rid}: {self._format_result(out)}")
+            if on_results is not None:
+                on_results(results)
+
+        try:
+            future = launch(finish)
+        except Exception as e:
+            finish(error=e)
+            return
+
+        with self._lock:
+            if token == self._op_token and not state["done"]:
+                self._op_future = future
+
+        if future is not None and hasattr(future, "add_done_callback"):
+            future.add_done_callback(
+                lambda settled: self._on_operation_settled(settled, finish)
+            )
+
+    @staticmethod
+    def _on_operation_settled(future, finish):
+        """Backstop: unlock when the coroutine ends without calling back.
+
+        A no-op in the normal case — ``finish`` is idempotent and the command's
+        own callback has already run by the time the future settles.
+        """
+        try:
+            if future.cancelled():
+                finish(error="cancelled")
+                return
+            error = future.exception()
+        except Exception as e:
+            finish(error=e)
+            return
+        finish(error=error)
+
+    def _abort_operation(self):
+        """Cancel the in-flight command and unlock the dashboard."""
+        with self._lock:
+            busy, name, future = self._busy, self._op_name, self._op_future
+
+        if not busy:
+            self._log("No operation is running — nothing to abort.")
+            return
+
+        if not self._confirm(f"Abort '{name}' and unlock the dashboard?"):
+            self._log(f"Abort of '{name}' cancelled.")
+            return
+
+        cancelled = False
+        if future is not None:
+            try:
+                cancelled = future.cancel()
+            except Exception:
+                cancelled = False
+
+        with self._lock:
+            # Silence the abandoned operation's callback and hand the busy flag
+            # to a fresh token, so its late results can't unlock a later command.
+            if self._op_state is not None:
+                self._op_state["done"] = True
+            self._op_token += 1
+            self._busy = False
+            self._emergency_stop_active = False
+            self._client_status_pending = False
+            self._op_name = ""
+            self._op_future = None
+            self._op_state = None
+
+        self._log(
+            f"Aborted '{name}'. "
+            + (
+                "Fleet task cancelled."
+                if cancelled
+                else "Fleet task was already past the point of cancellation."
+            )
+            + " Commands already sent to a workstation keep running there — "
+            "press [R] to resync status."
+        )
+        self._set_notice(f"'{name}' aborted. Controls unlocked.")
+
+    def _busy_status_line(self) -> str:
+        if not self._busy:
+            return ""
+        elapsed = time.time() - self._op_started
+        return (
+            f"Running '{self._op_name or 'operation'}' ({elapsed:.0f}s)"
+            " — [A] aborts and unlocks"
+        )
+
+    def _throttled_busy_log(self, message: str):
+        """Log a 'still running' notice at most once every 1.5s."""
+        now = time.time()
+        if now - self._last_busy_notice > 1.5:
+            self._last_busy_notice = now
+            self._log(message)
+
     # ── command actions ─────────────────────────────────────────
 
-    def _refresh_status(self):
-        self._busy = True
-        self._log("Refreshing status...")
-        self.fleet.check_all_status(callback=self._on_status_done)
+    def _refresh_status(self, start_message: str = "Refreshing status..."):
+        self._start_operation(
+            "Refresh",
+            lambda done: self.fleet.check_all_status(callback=lambda *_: done()),
+            start_message=start_message,
+            on_results=self._on_status_done,
+        )
 
     def _on_status_done(self, *_args):
-        with self._lock:
-            self._busy = False
         self._announce_runtime_state()
         self._log("Status refresh complete.")
         self._refresh_client_status()
@@ -255,19 +429,16 @@ class Dashboard:
             self._log(f"{name} cancelled.")
             return
 
-        self._busy = True
-        self._log(f"Executing '{name}' on {self._target_label(targets)}...")
+        self._start_operation(
+            name,
+            lambda done: action_fn(targets, callback=done),
+            start_message=f"Executing '{name}' on {self._target_label(targets)}...",
+            on_results=lambda _results: self._on_broadcast_done(name),
+        )
 
-        def on_done(results=None):
-            with self._lock:
-                self._busy = False
-            if results:
-                for rid, out in results.items():
-                    self._log(f"  WS-{rid}: {self._format_result(out)}")
-            self._announce_runtime_state()
-            self._log(f"'{name}' complete.")
-
-        action_fn(targets, callback=on_done)
+    def _on_broadcast_done(self, name: str):
+        self._announce_runtime_state()
+        self._log(f"'{name}' complete.")
 
     def _do_boot(self):
         """Boot selected robots, or all robots when none are selected."""
@@ -279,19 +450,12 @@ class Dashboard:
             self._log("Boot cancelled.")
             return
 
-        self._busy = True
-        self._log(f"Booting {self._target_label(targets)}...")
-
-        def on_done(results=None):
-            with self._lock:
-                self._busy = False
-            if results:
-                for rid, out in results.items():
-                    self._log(f"  WS-{rid}: {self._format_result(out)}")
-            self._announce_runtime_state()
-            self._log("Boot complete.")
-
-        self.dispatcher.boot(targets, callback=on_done)
+        self._start_operation(
+            "Boot",
+            lambda done: self.dispatcher.boot(targets, callback=done),
+            start_message=f"Booting {self._target_label(targets)}...",
+            on_results=lambda _results: self._on_broadcast_done("Boot"),
+        )
 
     def _do_shutdown(self):
         """Disable, kill tunnels, then shutdown selected/all active robots."""
@@ -305,21 +469,15 @@ class Dashboard:
             self._log("Shutdown cancelled.")
             return
 
-        self._busy = True
-        self._log(
-            f"Disabling, killing tunnels, and shutting down {self._target_label(active)}..."
+        self._start_operation(
+            "Shutdown",
+            lambda done: self.dispatcher.shutdown(active, callback=done),
+            start_message=(
+                "Disabling, killing tunnels, and shutting down "
+                f"{self._target_label(active)}..."
+            ),
+            on_results=lambda _results: self._on_broadcast_done("Shutdown"),
         )
-
-        def on_done(results=None):
-            with self._lock:
-                self._busy = False
-            if results:
-                for rid, out in results.items():
-                    self._log(f"  WS-{rid}: {self._format_result(out)}")
-            self._announce_runtime_state()
-            self._log("Shutdown complete.")
-
-        self.dispatcher.shutdown(active, callback=on_done)
 
     def _do_start_tunnel(self):
         """Start SSH tunnels on selected robots, or all when none are selected."""
@@ -331,18 +489,12 @@ class Dashboard:
             self._log("Start Tunnel cancelled.")
             return
 
-        self._busy = True
-        self._log(f"Starting SSH tunnel on {self._target_label(targets)}...")
-
-        def on_done(results=None):
-            with self._lock:
-                self._busy = False
-            if results:
-                for rid, out in results.items():
-                    self._log(f"  WS-{rid}: {self._format_result(out)}")
-            self._log("Start Tunnel complete.")
-
-        self.dispatcher.start_tunnel(targets, callback=on_done)
+        self._start_operation(
+            "Start Tunnel",
+            lambda done: self.dispatcher.start_tunnel(targets, callback=done),
+            start_message=f"Starting SSH tunnel on {self._target_label(targets)}...",
+            on_results=lambda _results: self._log("Start Tunnel complete."),
+        )
 
     def _do_kill_tunnel(self):
         """Kill SSH tunnels on selected robots, or all when none are selected."""
@@ -354,18 +506,12 @@ class Dashboard:
             self._log("Kill Tunnel cancelled.")
             return
 
-        self._busy = True
-        self._log(f"Killing SSH tunnel on {self._target_label(targets)}...")
-
-        def on_done(results=None):
-            with self._lock:
-                self._busy = False
-            if results:
-                for rid, out in results.items():
-                    self._log(f"  WS-{rid}: {self._format_result(out)}")
-            self._log("Kill Tunnel complete.")
-
-        self.dispatcher.kill_tunnel(targets, callback=on_done)
+        self._start_operation(
+            "Kill Tunnel",
+            lambda done: self.dispatcher.kill_tunnel(targets, callback=done),
+            start_message=f"Killing SSH tunnel on {self._target_label(targets)}...",
+            on_results=lambda _results: self._log("Kill Tunnel complete."),
+        )
 
     def _open_process_menu(
         self,
@@ -451,19 +597,12 @@ class Dashboard:
         process_key: str | None = None,
         is_start: bool = False,
     ):
-        self._busy = True
-        self._log(f"{present_participle} on {self._target_label(targets)}...")
         if process_key == "client" and is_start:
             self._client_running_robot_ids.update(robot.id for robot in targets)
             self._apply_client_robot_status({robot.id for robot in targets})
             self._set_notice("Clients starting. Space is now emergency-stop.")
 
-        def on_done(results=None):
-            with self._lock:
-                self._busy = False
-            if results:
-                for rid, out in results.items():
-                    self._log(f"  WS-{rid}: {self._format_result(out)}")
+        def on_results(results=None):
             if process_key == "client":
                 self._update_client_state_from_results(
                     targets,
@@ -474,7 +613,12 @@ class Dashboard:
             if process_key == "client":
                 self._refresh_client_status()
 
-        action_fn(targets, callback=on_done)
+        self._start_operation(
+            name,
+            lambda done: action_fn(targets, callback=done),
+            start_message=f"{present_participle} on {self._target_label(targets)}...",
+            on_results=on_results,
+        )
 
     def _do_connect_to_server(self):
         booted = self._eligible_targets("connect", self._command_targets())
@@ -545,7 +689,23 @@ class Dashboard:
                 elif previous:
                     self._log("No running clients detected.")
 
-        self.fleet.check_clients(targets, callback=on_done)
+        try:
+            future = self.fleet.check_clients(targets, callback=on_done)
+        except Exception as e:
+            self._client_status_pending = False
+            self._log(f"Client status check could not be submitted: {e}")
+            return
+
+        # Backstop, same reasoning as _start_operation: a check that ends
+        # without calling back would otherwise leave `_client_status_pending`
+        # stuck True and freeze the client-running set for the rest of the
+        # session — including the set that Space's emergency stop reads.
+        if future is not None and hasattr(future, "add_done_callback"):
+            future.add_done_callback(lambda _f: self._clear_client_status_pending())
+
+    def _clear_client_status_pending(self):
+        with self._lock:
+            self._client_status_pending = False
 
     def _emergency_stop_clients(self):
         """Immediately kill all known running clients; no confirmation by design."""
@@ -560,17 +720,14 @@ class Dashboard:
             return
 
         self._emergency_stop_active = True
-        self._busy = True
         self._set_notice("EMERGENCY STOP: killing clients now.", seconds=4.0)
-        self._log(f"EMERGENCY STOP: killing clients on {self._target_label(targets)}.")
         try:
             curses.beep()
         except curses.error:
             pass
 
-        def on_done(results=None):
+        def on_results(_results=None):
             with self._lock:
-                self._busy = False
                 self._emergency_stop_active = False
                 self._client_running_robot_ids.difference_update(
                     robot.id for robot in targets
@@ -579,14 +736,18 @@ class Dashboard:
                     self._client_running_robot_ids,
                     checked_ids={robot.id for robot in targets},
                 )
-            if results:
-                for rid, out in results.items():
-                    self._log(f"  WS-{rid}: {self._format_result(out)}")
             self._set_notice("Emergency client stop complete.", seconds=3.0)
             self._log("Emergency client stop complete.")
             self._refresh_client_status()
 
-        self.dispatcher.kill_client(targets, callback=on_done)
+        self._start_operation(
+            "Emergency Stop",
+            lambda done: self.dispatcher.kill_client(targets, callback=done),
+            start_message=(
+                f"EMERGENCY STOP: killing clients on {self._target_label(targets)}."
+            ),
+            on_results=on_results,
+        )
 
     def _update_client_state_from_results(
         self,
@@ -780,20 +941,22 @@ class Dashboard:
         self._right_text(stdscr, y, x, w, badge, badge_attr)
 
         notice = self._active_notice()
+        notice_attr = curses.color_pair(PAIR_OFFLINE) | curses.A_BOLD
         if not notice and clients_running:
             notice = (
                 f"Clients running on {self._format_robot_ids(self._client_running_targets())}. "
                 "SPACE = EMERGENCY STOP"
             )
+        if not notice:
+            # A running command is ordinary, not an alarm — and the elapsed
+            # counter is what tells the operator the console is still alive
+            # rather than wedged.
+            busy_line = self._busy_status_line()
+            if busy_line:
+                notice = busy_line
+                notice_attr = curses.color_pair(PAIR_NOTICE) | curses.A_BOLD
         if notice:
-            self._center_text(
-                stdscr,
-                y + 1,
-                x,
-                w,
-                notice,
-                curses.color_pair(PAIR_OFFLINE) | curses.A_BOLD,
-            )
+            self._center_text(stdscr, y + 1, x, w, notice, notice_attr)
         else:
             offline, booted, online = self._status_counts()
             segments = [
