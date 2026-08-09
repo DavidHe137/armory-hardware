@@ -38,6 +38,56 @@ DEFAULT_EPISODE_SUBDIR = "armory_episodes"
 BARRIER_READY_FLAG = "/tmp/armory_ready.flag"
 BARRIER_GO_FLAG = "/tmp/armory_go.flag"
 
+# The lab image defines `p` only as an alias, appended to the container's
+# ~/.bashrc *below* the stock "if not running interactively, don't do anything"
+# guard. Aliases also don't expand in non-interactive shells. Both facts used to
+# force `bash -ic` here, which needs a TTY it never gets over asyncssh and buries
+# the real error under job-control warnings. We invoke the script the alias points
+# at instead, sourcing the same three things the bashrc tail sources.
+PIPER_CTRL_SCRIPT = "/piper_ros/scripts/p_ctrl.py"
+PIPER_ROS_SETUP = "/piper_ros/install/setup.bash"
+# Exports ROS_DOMAIN_ID derived from the workstation hostname — required for ROS 2
+# peering, so it must be sourced even though we bypass the alias it also defines.
+PIPER_RC_SETUP = "/piper_ros/scripts/setup_rc.sh"
+PIPER_LD_LIBRARY_PATH = "/usr/lib/x86_64-linux-gnu"
+
+# Emitted by an interactive bash with no controlling terminal. Harmless, but it
+# lands on stderr and used to be reported as though the command had failed.
+_JOB_CONTROL_NOISE = (
+    "cannot set terminal process group",
+    "no job control in this shell",
+)
+
+
+def _container_script(command: str) -> str:
+    """Expand a fleet command into a self-contained script for the container.
+
+    ``p <args>`` becomes an explicit ``source``-then-``python3`` sequence so it
+    works under a non-interactive shell; anything else is passed through
+    untouched. Sourcing the setup files by name also means a broken or unmounted
+    ``/piper_ros`` fails the command outright, instead of leaving ``p`` quietly
+    undefined and surfacing as ``p: command not found`` on stderr.
+    """
+    if command != "p" and not command.startswith("p "):
+        return command
+    args = command[1:].strip()
+    return (
+        f"source {PIPER_ROS_SETUP} && "
+        f"source {PIPER_RC_SETUP} && "
+        f"export LD_LIBRARY_PATH={PIPER_LD_LIBRARY_PATH}:$LD_LIBRARY_PATH && "
+        f"python3 {PIPER_CTRL_SCRIPT} {args}"
+    )
+
+
+def _clean_stderr(stderr: str) -> str:
+    """Drop bash's job-control warnings so only real errors are reported."""
+    lines = [
+        line
+        for line in stderr.splitlines()
+        if not any(noise in line for noise in _JOB_CONTROL_NOISE)
+    ]
+    return "\n".join(lines).strip()
+
 
 class FleetController:
     """Orchestrates a fleet of real robot workstations over SSH + Docker."""
@@ -323,18 +373,31 @@ class FleetController:
         logger = self._loggers[robot.id]
         try:
             conn = await self._get_connection(robot)
-            cmd = f"docker exec {DOCKER_CONTAINER} bash -ic 'source ~/.bashrc && {command}'"
+            script = _container_script(command)
+            cmd = f"docker exec {DOCKER_CONTAINER} bash -lc {shlex.quote(script)}"
             logger.info("Executing: %s", cmd)
+            # `command` (not `script`) in operator-facing output — the expanded
+            # script is several lines of sourcing and only useful in the log.
             self._emit(f"WS-{robot.id}: running '{command}'")
-            result = await conn.run(cmd, timeout=30)
+            result = await conn.run(cmd, timeout=30, check=False)
             stdout = result.stdout.strip()
-            stderr = result.stderr.strip()
+            stderr = _clean_stderr(result.stderr)
             if stdout:
                 logger.info("stdout: %s", stdout)
                 self._emit(f"WS-{robot.id}: {stdout[:120]}")
             if stderr:
                 logger.warning("stderr: %s", stderr)
                 self._emit(f"WS-{robot.id} err: {stderr[:120]}")
+            if result.exit_status != 0:
+                detail = stderr or stdout or "no output"
+                logger.error(
+                    "Command '%s' exited %s: %s", command, result.exit_status, detail
+                )
+                self._emit(
+                    f"WS-{robot.id}: FAILED '{command}' "
+                    f"(exit {result.exit_status}) — {detail[:100]}"
+                )
+                return f"ERROR: '{command}' exited {result.exit_status} — {detail}"
             return stdout or stderr or "(no output)"
         except Exception as e:
             logger.error("Command '%s' failed: %s", command, e)
@@ -355,6 +418,17 @@ class FleetController:
         if callback:
             callback(results)
         return results
+
+    def _require_piper_root(self, robot: Robot) -> str:
+        """Lab checkout root on the workstation, or raise with a fixable message."""
+        root = self.config.piper_root
+        if not root:
+            raise RuntimeError(
+                f"WS-{robot.id}: piper_docker_dir is not configured — set "
+                "ARMORY_PIPER_DOCKER_DIR in .env (or docker.piper_dir in the "
+                "fleet YAML) to the workstation's PIPER_DOCKER_DIR"
+            )
+        return root
 
     async def _boot_single(self, robot: Robot) -> str:
         logger = self._loggers[robot.id]
@@ -382,21 +456,29 @@ class FleetController:
             logger.info("Starting Docker container in detached mode")
             self._emit(f"WS-{robot.id}: starting Docker container...")
 
+            piper_root = self._require_piper_root(robot)
+
             # piper_start uses `docker run -it` which blocks and needs a TTY.
             # Instead, run in detached mode (-d) with --entrypoint overridden
             # to `sleep` so the container stays alive, then launch the real
             # entrypoint via docker exec.
+            #
+            # The lab paths are interpolated from config rather than expanded by
+            # the remote shell. --mount (not -v) is used for them so Docker
+            # rejects a source that does not exist instead of helpfully creating
+            # an empty root-owned directory and booting a container with nothing
+            # in it. $DISPLAY stays shell-expanded — it is genuinely per-session.
             boot_cmd = (
-                "bash -lc 'source ~/.bashrc && docker run -d"
+                "bash -lc 'docker run -d"
                 " --privileged --net=host --runtime=nvidia --gpus all"
                 f" --name {DOCKER_CONTAINER}"
                 " --entrypoint sleep"
                 " -e NVIDIA_DRIVER_CAPABILITIES=all"
                 ' -e DISPLAY=$DISPLAY'
                 " -v /tmp/.X11-unix/:/tmp/.X11-unix/:rw"
-                ' -v $PIPER_DOCKER_DIR/../user_data/:/CS4803ARM_Lab/user_data/'
-                ' -v $PIPER_DOCKER_DIR/../assets/:/CS4803ARM_Lab/assets/'
-                ' -v $PIPER_DOCKER_DIR/../user_data/piper_ros/:/piper_ros/'
+                f" --mount type=bind,source={piper_root}/user_data,target=/CS4803ARM_Lab/user_data"
+                f" --mount type=bind,source={piper_root}/assets,target=/CS4803ARM_Lab/assets"
+                f" --mount type=bind,source={piper_root}/user_data/piper_ros,target=/piper_ros"
                 " -v /home/data_collection/dhe83/:/datasets/"
                 " -v /dev:/dev"
                 " -w /CS4803ARM_Lab/user_data/data_collection"
@@ -423,6 +505,22 @@ class FleetController:
                 logger.warning("Container failed to start")
                 self._emit(f"WS-{robot.id}: container failed to start")
                 return "Boot failed — container not detected after docker run"
+
+            # A container whose /piper_ros is empty starts fine and fails later on
+            # the first `p` command. Catch it here, while the cause is still in view.
+            probe = await conn.run(
+                f"docker exec {DOCKER_CONTAINER} test -f {PIPER_ROS_SETUP}",
+                timeout=10,
+                check=False,
+            )
+            if probe.exit_status != 0:
+                msg = (
+                    f"container is up but {PIPER_ROS_SETUP} is missing — "
+                    f"check that {piper_root}/user_data/piper_ros is populated"
+                )
+                logger.error(msg)
+                self._emit(f"WS-{robot.id}: {msg}")
+                return f"ERROR: {msg}"
 
             # Run the entrypoint inside the container
             self._emit(f"WS-{robot.id}: container up, running entrypoint...")
@@ -1197,18 +1295,15 @@ class FleetController:
         cached = self._user_data_host_path.get(robot.id)
         if cached:
             return cached
+        path = f"{self._require_piper_root(robot)}/user_data"
+        # Confirm it exists rather than trusting config — a stale value here would
+        # otherwise surface as an empty fetch that looks like "no episodes".
         conn = await self._get_connection(robot)
-        # PIPER_DOCKER_DIR is set in the workstation's ~/.bashrc; resolve via a
-        # login shell so the env var is available, then normalize the path.
-        result = await conn.run(
-            "bash -lc 'readlink -f \"$PIPER_DOCKER_DIR/../user_data\"'",
-            timeout=10,
-        )
-        path = result.stdout.strip()
-        if not path:
+        check = await conn.run(f"test -d {shlex.quote(path)}", timeout=10, check=False)
+        if check.exit_status != 0:
             raise RuntimeError(
-                f"WS-{robot.id}: could not resolve $PIPER_DOCKER_DIR/../user_data; "
-                "is PIPER_DOCKER_DIR set in ~/.bashrc?"
+                f"WS-{robot.id}: {path} does not exist — check "
+                "ARMORY_PIPER_DOCKER_DIR in .env"
             )
         self._user_data_host_path[robot.id] = path
         return path

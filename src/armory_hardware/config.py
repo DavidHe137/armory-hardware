@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import getpass
 import os
+import posixpath
 import random
 from dataclasses import dataclass
 from enum import Enum
@@ -93,6 +94,16 @@ class FleetConfig:
             webcam_cfg.get("rtsp_base_url"), "ARMORY_WEBCAM_RTSP_BASE_URL", ""
         )
 
+        # Workstation-side lab checkout. Named after the workstation's own
+        # PIPER_DOCKER_DIR, but read from here rather than the workstation's
+        # ~/.bashrc: that file only defines the variable for interactive shells,
+        # so every non-interactive lookup silently produced an empty string and
+        # bind-mounted the wrong host paths.
+        docker_cfg = raw.get("docker") or {}
+        self.piper_docker_dir = _setting(
+            docker_cfg.get("piper_dir"), "ARMORY_PIPER_DOCKER_DIR", ""
+        )
+
         used_names: set[str] = set()
         self.robots: list[Robot] = []
         for entry in raw.get("workstations", []):
@@ -111,6 +122,17 @@ class FleetConfig:
         else:
             p = os.path.expanduser(str(raw_log_dir).strip())
             self._log_dir = p if os.path.isabs(p) else os.path.normpath(os.path.join(repo_root, p))
+
+    @property
+    def piper_root(self) -> str:
+        """Parent of ``piper_docker_dir`` — holds ``user_data/`` and ``assets/``.
+
+        Empty when ``piper_docker_dir`` is unset, so callers can report a missing
+        setting instead of building a path rooted at ``/``.
+        """
+        if not self.piper_docker_dir:
+            return ""
+        return posixpath.normpath(posixpath.join(self.piper_docker_dir, ".."))
 
     def get_robot(self, robot_id: int) -> Robot | None:
         for r in self.robots:

@@ -1,8 +1,9 @@
 # Fleet layout for armory-tui (see FleetConfig).
 #
-# Operator-specific values -- SSH account, address range, jump host, camera server --
-# are NOT stored here. They come from .env (copy .env.example) or the environment.
-# Adding an ssh/tunnel/webcam key below overrides the environment for that value.
+# Operator-specific values -- SSH account, address range, jump host, camera server,
+# and the workstation lab checkout (ARMORY_PIPER_DOCKER_DIR) -- are NOT stored here.
+# They come from .env (copy .env.example) or the environment. Adding an ssh, tunnel,
+# webcam, or docker section below overrides the environment for those values.
 
 logging:
   # Per-workstation and system file logs (workstation_*.log, armory_system.log).

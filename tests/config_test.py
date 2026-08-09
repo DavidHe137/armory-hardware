@@ -65,6 +65,7 @@ _ENV_VARS = [
     "ARMORY_TUNNEL_USER",
     "ARMORY_TUNNEL_SERVER",
     "ARMORY_WEBCAM_RTSP_BASE_URL",
+    "ARMORY_PIPER_DOCKER_DIR",
 ]
 
 
@@ -140,6 +141,39 @@ def test_env_supplies_settings_absent_from_yaml(tmp_path, monkeypatch):
     assert cfg.webcam_rtsp_base_url == "rtsp://cam.example:8554"
 
 
+def test_piper_root_is_parent_of_docker_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARMORY_PIPER_DOCKER_DIR", "/nethome/tester/CS4803ARM_Lab/docker")
+
+    cfg_path = _write_yaml(
+        tmp_path / "fleet.yaml",
+        """
+        workstations:
+          - id: 1
+        """,
+    )
+
+    cfg = FleetConfig(cfg_path)
+
+    assert cfg.piper_docker_dir == "/nethome/tester/CS4803ARM_Lab/docker"
+    assert cfg.piper_root == "/nethome/tester/CS4803ARM_Lab"
+
+
+def test_piper_root_empty_when_unset(tmp_path, clean_env):
+    """Unset must stay empty, not collapse to '/' — that was the mis-mount bug."""
+    cfg_path = _write_yaml(
+        tmp_path / "fleet.yaml",
+        """
+        workstations:
+          - id: 1
+        """,
+    )
+
+    cfg = FleetConfig(cfg_path)
+
+    assert cfg.piper_docker_dir == ""
+    assert cfg.piper_root == ""
+
+
 def test_yaml_value_beats_env(tmp_path, monkeypatch):
     monkeypatch.setenv("ARMORY_SSH_USER", "envuser")
     monkeypatch.setenv("ARMORY_TUNNEL_SERVER", "env.example.edu")
@@ -167,7 +201,7 @@ def test_no_personal_identifiers_in_committed_config():
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     text = open(os.path.join(repo_root, "configs", "armory-tui.yaml")).read()
 
-    for section in ("ssh:", "tunnel:", "webcam:"):
+    for section in ("ssh:", "tunnel:", "webcam:", "docker:"):
         assert section not in text
 
 
