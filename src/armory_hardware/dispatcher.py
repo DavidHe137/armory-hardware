@@ -66,6 +66,16 @@ class FleetDispatcher:
         """Disable first, kill tunnels, then stop Docker containers."""
         return self.fleet.submit(self._shutdown_safely(robots, callback))
 
+    def kill_all(self, robots: list[Robot], callback: Callable | None = None):
+        """Force-stop everything on the selected robots, container included.
+
+        Unlike ``shutdown``, no step gates the ones after it: clients,
+        listeners, webcam streams, tunnels, and the Docker container are all
+        torn down even when an earlier step fails, so a wedged arm or
+        half-dead container can't block the cleanup.
+        """
+        return self.fleet.submit(self._kill_all(robots, callback))
+
     def build_workspace(self, robots: list[Robot], callback: Callable | None = None):
         """Rebuild the shared piper workspace on one selected workstation.
 
@@ -224,6 +234,43 @@ class FleetDispatcher:
                 continue
 
             results[robot.id] = (
+                f"Reset: {reset_results.get(robot.id, 'unknown')}; "
+                f"Disable: {disable_results.get(robot.id, 'unknown')}; "
+                f"Tunnel: {tunnel_results.get(robot.id, 'unknown')}; "
+                f"Shutdown: {shutdown_results.get(robot.id, 'unknown')}"
+            )
+        if callback:
+            callback(results)
+        return results
+
+    async def _kill_all(
+        self,
+        robots: list[Robot],
+        callback: Callable | None = None,
+    ):
+        """Unconditional teardown of every process this console starts.
+
+        Ordered so the arm is never left executing a policy mid-teardown:
+        clients go first (SIGINT, so RealSaver still flushes), then the
+        passive processes, then a best-effort ``p goto reset``/``p disable``
+        to stow the arm before the container that drives it is removed. No
+        skip-when-offline filter and no disable safeguard — this is the
+        recovery path for exactly the states where those checks lie.
+        """
+        client_results = await self.fleet._kill_clients(robots)
+        listener_results = await self.fleet._kill_data_listeners(robots)
+        webcam_results = await self.fleet._kill_webcam_streams(robots)
+        reset_results = await self.fleet._run_on_robots(robots, "p goto reset")
+        disable_results = await self.fleet._run_on_robots(robots, "p disable")
+        tunnel_results = await self.fleet._kill_tunnels(robots)
+        shutdown_results = await self.fleet._shutdown_robots(robots)
+
+        results = {}
+        for robot in robots:
+            results[robot.id] = (
+                f"Client: {client_results.get(robot.id, 'unknown')}; "
+                f"Listener: {listener_results.get(robot.id, 'unknown')}; "
+                f"Webcam: {webcam_results.get(robot.id, 'unknown')}; "
                 f"Reset: {reset_results.get(robot.id, 'unknown')}; "
                 f"Disable: {disable_results.get(robot.id, 'unknown')}; "
                 f"Tunnel: {tunnel_results.get(robot.id, 'unknown')}; "

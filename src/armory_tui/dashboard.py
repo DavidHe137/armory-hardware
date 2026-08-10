@@ -42,12 +42,13 @@ CORE_COMMANDS = [
     ("T", "Start Tunnel"),
     ("X", "Kill Tunnel"),
     ("7", "Shutdown"),
+    ("8", "Kill All"),
     ("R", "Refresh"),
     ("Q", "Quit"),
 ]
 
 # [A] Abort is deliberately not in the grid: it only does anything while a
-# command is in flight, and the grid truncates at six entries on a 24-row
+# command is in flight, and the grid truncates past four rows on a 24-row
 # terminal. It is advertised in the header instead, exactly when it applies.
 KEY_ABORT = "A"
 
@@ -248,6 +249,8 @@ class Dashboard:
             self._do_boot()
         elif ch == "7":
             self._do_shutdown()
+        elif ch == "8":
+            self._do_kill_all()
 
         return False
 
@@ -477,6 +480,44 @@ class Dashboard:
                 f"{self._target_label(active)}..."
             ),
             on_results=lambda _results: self._on_broadcast_done("Shutdown"),
+        )
+
+    def _do_kill_all(self):
+        """Force-stop clients, listeners, webcams, tunnels, and Docker.
+
+        No eligibility filter: the point is recovering workstations whose
+        reported status no longer matches reality, so every configured target
+        gets the full teardown and reports per-step results.
+        """
+        targets = self._command_targets()
+        if not targets:
+            self._log("No workstations configured for kill all.")
+            return
+        if not self._confirm(
+            f"Kill ALL processes and Docker on {self._target_label(targets)}?"
+        ):
+            self._log("Kill All cancelled.")
+            return
+
+        def on_results(_results=None):
+            with self._lock:
+                self._client_running_robot_ids.difference_update(
+                    robot.id for robot in targets
+                )
+                self._apply_client_robot_status(
+                    self._client_running_robot_ids,
+                    checked_ids={robot.id for robot in targets},
+                )
+            self._on_broadcast_done("Kill All")
+
+        self._start_operation(
+            "Kill All",
+            lambda done: self.dispatcher.kill_all(targets, callback=done),
+            start_message=(
+                "Killing clients, listeners, webcams, tunnels, and Docker on "
+                f"{self._target_label(targets)}..."
+            ),
+            on_results=on_results,
         )
 
     def _do_start_tunnel(self):
@@ -880,7 +921,9 @@ class Dashboard:
         header_h = 2
         gap = 1
         desired_log_h = max(7, min(10, content_h // 3))
-        min_body_h = 13 if self._runtime_controls_unlocked() else 10
+        # 14 = header rows + a four-row core grid + a three-row runtime grid;
+        # the log pane gives up rows first so no core command falls off.
+        min_body_h = 14 if self._runtime_controls_unlocked() else 10
         log_h = min(desired_log_h, content_h - header_h - (gap * 2) - min_body_h)
         body_h = content_h - header_h - log_h - (gap * 2)
 
@@ -893,7 +936,7 @@ class Dashboard:
         right_x = origin_x + side_w + gap
         right_y = origin_y + header_h + gap
         if self._runtime_controls_unlocked():
-            fleet_h = min(6, body_h - gap - 6)
+            fleet_h = min(7, body_h - gap - 6)
             fleet_h = max(5, fleet_h)
             runtime_h = body_h - fleet_h - gap
             self._draw_core_panel(right_y, right_x, fleet_h, right_w)
