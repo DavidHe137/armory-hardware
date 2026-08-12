@@ -111,6 +111,18 @@ class FleetConfig:
             _setting(policy_cfg.get("port"), "ARMORY_POLICY_PORT", "8080")
         )
 
+        # Host directory on each workstation that backs the container's
+        # /datasets mount -- where RealSaver's episodes actually land. Both the
+        # boot-time bind mount and the SFTP fetch read it from here, so the two
+        # can't drift: a fetch root that disagrees with the mount looks exactly
+        # like "the trial produced no data".
+        episodes_cfg = raw.get("episodes") or {}
+        self.episode_host_root = _setting(
+            episodes_cfg.get("host_root"),
+            "ARMORY_EPISODE_HOST_ROOT",
+            f"/home/data_collection/{self.ssh_user}",
+        ).rstrip("/")
+
         # Workstation-side lab checkout. Named after the workstation's own
         # PIPER_DOCKER_DIR, but read from here rather than the workstation's
         # ~/.bashrc: that file only defines the variable for interactive shells,

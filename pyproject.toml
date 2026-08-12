@@ -13,8 +13,12 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "asyncssh>=2.21",
+    "imageio-ffmpeg>=0.6.0",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
+    "requests>=2.33.1",
+    "tqdm>=4.67.3",
+    "tyro>=1.0.12",
 ]
 
 [project.optional-dependencies]

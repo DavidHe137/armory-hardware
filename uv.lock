@@ -12,8 +12,12 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "asyncssh" },
+    { name = "imageio-ffmpeg" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
+    { name = "requests" },
+    { name = "tqdm" },
+    { name = "tyro" },
 ]
 
 [package.optional-dependencies]
@@ -32,11 +36,15 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "asyncssh", specifier = ">=2.21" },
+    { name = "imageio-ffmpeg", specifier = ">=0.6.0" },
     { name = "imageio-ffmpeg", marker = "extra == 'trial'" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "pyyaml", specifier = ">=6.0" },
+    { name = "requests", specifier = ">=2.33.1" },
     { name = "requests", marker = "extra == 'trial'" },
+    { name = "tqdm", specifier = ">=4.67.3" },
     { name = "tqdm", marker = "extra == 'trial'" },
+    { name = "tyro", specifier = ">=1.0.12" },
     { name = "tyro", marker = "extra == 'trial'" },
 ]
 provides-extras = ["trial"]

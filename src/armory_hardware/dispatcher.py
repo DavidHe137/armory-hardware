@@ -116,6 +116,41 @@ class FleetDispatcher:
         """Stop the Piper client node inside Docker."""
         return self.fleet.kill_clients(robots, callback)
 
+    def check_runtime_processes(
+        self,
+        robots: list[Robot],
+        callback: Callable | None = None,
+    ):
+        """Report which arm-owning processes are alive on each robot.
+
+        Result is ``{robot_id: {"client": bool, "listener": bool}}``. Used to
+        gate the arm-motion broadcasts: a robot whose client or follower is
+        still running already has something publishing joint targets, and a
+        second commander fighting it over the same joints is how an arm ends up
+        slamming into the table.
+
+        A robot that cannot be reached reports both false, same as the
+        underlying checks — an unreachable robot is not going to execute the
+        motion command either.
+        """
+        return self.fleet.submit(self._check_runtime_processes(robots, callback))
+
+    def stop_runtime_processes(
+        self,
+        robots: list[Robot],
+        callback: Callable | None = None,
+        grace_sec: float = 5.0,
+    ):
+        """Stop the client and the follower on each robot, client first.
+
+        The client is what actively drives the arm, and its SIGINT-then-SIGKILL
+        path gives RealSaver time to flush; the follower it reads from is only
+        torn down once the client is gone.
+        """
+        return self.fleet.submit(
+            self._stop_runtime_processes(robots, callback, grace_sec)
+        )
+
     def run_trial(
         self,
         robots: list[Robot],
@@ -127,26 +162,36 @@ class FleetDispatcher:
         callback: Callable | None = None,
         control_hz_overrides: dict[int, int] | None = None,
         prompt_overrides: dict[int, str] | None = None,
-        execution_horizon_overrides: dict[int, int] | None = None,
+        min_execution_horizon_overrides: dict[int, int] | None = None,
+        max_execution_horizon_overrides: dict[int, int] | None = None,
         on_clients_running: Callable[[], None] | None = None,
         on_clients_stopping: Callable[[], None] | None = None,
+        trial_id: str = "",
     ):
         """Run a bounded client trial then fetch each robot's data via SFTP.
 
         Sequence:
-          1. ``start_clients(robots)``
+          1. ``start_clients(robots)`` into this trial's own episode directory
           2. wait ``duration_sec`` seconds
           3. ``kill_clients(robots, grace_sec=grace_sec)`` (SIGINT, then SIGKILL)
           4. brief settle so RealSaver flushes its background writes
           5. ``fetch_episode_data(robots, output_dir, remote_subdir, fetch_video)``
 
-        ``control_hz_overrides`` (ws id → hz), ``prompt_overrides``
-        (ws id → prompt string), and ``execution_horizon_overrides``
-        (ws id → action-chunk horizon) are forwarded per-robot to
-        ``piper_client_armory`` as ``--control-hz <N>``,
-        ``--prompt <STRING>``, and ``--execution-horizon <N>`` respectively,
+        ``control_hz_overrides`` (ws id → hz), ``prompt_overrides`` (ws id →
+        prompt string), and ``min_execution_horizon_overrides`` /
+        ``max_execution_horizon_overrides`` (ws id → action-chunk horizon
+        bound) are forwarded per-robot to ``piper_client_armory`` as
+        ``--control-hz <N>``, ``--prompt <STRING>``,
+        ``--min-execution-horizon <N>`` and ``--max-execution-horizon <N>``,
         after a single leading ``--`` separator. Robots not present in a
         given dict use the node's declared default for that parameter.
+
+        ``trial_id`` names this trial's episode subtree on every workstation
+        and defaults to ``output_dir.name``. RealSaver numbers episodes from
+        zero per client process and creates its folders with ``exist_ok``, so
+        without this every trial writes over the last one at the same path —
+        and any robot that produced nothing this trial still has the previous
+        trial's episode there to be fetched as though it were fresh.
 
         ``on_clients_running`` (optional) is invoked once, in the fleet event
         loop thread, immediately after the startup barrier go signal is sent
@@ -165,12 +210,15 @@ class FleetDispatcher:
         Returns a Future whose result is a summary dict with keys
         ``start``, ``kill``, ``fetch``, and ``output_dir``.
         """
+        output_dir = pathlib.Path(output_dir)
         return self.fleet.submit(
             self._run_trial(
-                robots, duration_sec, pathlib.Path(output_dir),
+                robots, duration_sec, output_dir,
                 fetch_video, grace_sec, remote_subdir, callback,
-                control_hz_overrides, prompt_overrides, execution_horizon_overrides,
+                control_hz_overrides, prompt_overrides,
+                min_execution_horizon_overrides, max_execution_horizon_overrides,
                 on_clients_running, on_clients_stopping,
+                trial_id or output_dir.name,
             )
         )
 
@@ -199,6 +247,48 @@ class FleetDispatcher:
         await self.fleet._run_on_robots(booted, "p goto reset")
         # Step 2: p disable
         await self.fleet._run_on_robots(booted, "p disable", callback)
+
+    async def _check_runtime_processes(
+        self,
+        robots: list[Robot],
+        callback: Callable | None = None,
+    ):
+        # Sequential, not gathered: each probe already fans out across the whole
+        # fleet, and running both at once would put two concurrent `docker exec`
+        # channels on every robot's connection for no operator-visible gain.
+        client_results = await self.fleet._check_clients(robots)
+        listener_results = await self.fleet._check_data_listeners(robots)
+
+        results = {
+            robot.id: {
+                "client": bool(client_results.get(robot.id)),
+                "listener": bool(listener_results.get(robot.id)),
+            }
+            for robot in robots
+        }
+        if callback:
+            callback(results)
+        return results
+
+    async def _stop_runtime_processes(
+        self,
+        robots: list[Robot],
+        callback: Callable | None = None,
+        grace_sec: float = 5.0,
+    ):
+        client_results = await self.fleet._kill_clients(robots, grace_sec=grace_sec)
+        listener_results = await self.fleet._kill_data_listeners(robots)
+
+        results = {
+            robot.id: (
+                f"Client: {client_results.get(robot.id, 'unknown')}; "
+                f"Listener: {listener_results.get(robot.id, 'unknown')}"
+            )
+            for robot in robots
+        }
+        if callback:
+            callback(results)
+        return results
 
     async def _shutdown_safely(
         self,
@@ -291,9 +381,11 @@ class FleetDispatcher:
         callback: Callable | None,
         control_hz_overrides: dict[int, int] | None = None,
         prompt_overrides: dict[int, str] | None = None,
-        execution_horizon_overrides: dict[int, int] | None = None,
+        min_execution_horizon_overrides: dict[int, int] | None = None,
+        max_execution_horizon_overrides: dict[int, int] | None = None,
         on_clients_running: Callable[[], None] | None = None,
         on_clients_stopping: Callable[[], None] | None = None,
+        trial_id: str = "",
     ):
         log = self.fleet.logger
         n = len(robots)
@@ -301,7 +393,7 @@ class FleetDispatcher:
         # Use --control-hz / --prompt / --barrier (argparse layer in
         # client_node_armory) rather than --ros-args -p key:=value: avoids both
         # the int/float type mismatch against declare_parameter("control_hz",
-        # 20.0) and any precedence confusion when the node also builds
+        # 30.0) and any precedence confusion when the node also builds
         # parameter_overrides. The leading `--` is the conventional "end of
         # ros2 args" separator; `ros2 run` strips it before invoking the entry
         # point, so argparse never sees it. ``--barrier`` is added for every
@@ -311,7 +403,8 @@ class FleetDispatcher:
         extra_args_per_robot = self._build_extra_args(
             control_hz_overrides,
             prompt_overrides,
-            execution_horizon_overrides=execution_horizon_overrides,
+            min_execution_horizon_overrides=min_execution_horizon_overrides,
+            max_execution_horizon_overrides=max_execution_horizon_overrides,
             barrier_robot_ids=target_ids,
         )
         if extra_args_per_robot:
@@ -338,11 +431,18 @@ class FleetDispatcher:
         # starting state.
         await self.fleet._clear_barrier_flags(robots)
 
+        # One episode tree per trial, so nothing this trial fetches can be a
+        # leftover and nothing it writes can land on a previous trial's files.
+        episode_dir = self.fleet.episode_container_dir(remote_subdir, trial_id)
         log.info(
-            f"trial: start_clients on {n} robot(s); will run for {duration_sec:.1f}s"
+            f"trial: start_clients on {n} robot(s); will run for {duration_sec:.1f}s; "
+            f"episodes -> {episode_dir}"
         )
         start_results = await self.fleet._start_clients(
-            robots, callback=None, extra_args_per_robot=extra_args_per_robot,
+            robots,
+            callback=None,
+            extra_args_per_robot=extra_args_per_robot,
+            episode_dir=episode_dir,
         )
 
         # Rendezvous: every client should reach the --barrier and touch
@@ -403,6 +503,7 @@ class FleetDispatcher:
             remote_subdir=remote_subdir,
             include_video=fetch_video,
             callback=None,
+            trial_id=trial_id,
         )
 
         summary = {
@@ -424,21 +525,29 @@ class FleetDispatcher:
     def _build_extra_args(
         control_hz_overrides: dict[int, int] | None,
         prompt_overrides: dict[int, str] | None,
-        execution_horizon_overrides: dict[int, int] | None = None,
+        min_execution_horizon_overrides: dict[int, int] | None = None,
+        max_execution_horizon_overrides: dict[int, int] | None = None,
         barrier_robot_ids: set[int] | None = None,
     ) -> dict[int, str] | None:
         """Merge per-robot overrides into a single ``--<flag> <value> …`` suffix.
 
         Returns ``{robot_id: " -- --control-hz X --prompt 'STRING'
-        --execution-horizon N --barrier "}`` for each robot that has at least
-        one override (or has the barrier enabled); ``None`` if no robot has
-        anything to add. The prompt is shell-quoted because it may contain
-        spaces, and the whole string is interpolated verbatim into a bash
-        command in fleet.py.
+        --min-execution-horizon N --max-execution-horizon N --barrier "}`` for
+        each robot that has at least one override (or has the barrier enabled);
+        ``None`` if no robot has anything to add. The prompt is shell-quoted
+        because it may contain spaces, and the whole string is interpolated
+        verbatim into a bash command in fleet.py.
+
+        Every flag here must exist in ``client_node_armory``'s argparse. That
+        parser runs ``parse_known_args``, so a flag it does not define is not
+        an error — it is dropped in silence, and the trial runs at the node's
+        default as though the override had been honoured. The horizon is a
+        min/max pair there, not a single value.
         """
         rids: set[int] = set(control_hz_overrides or {})
         rids |= set(prompt_overrides or {})
-        rids |= set(execution_horizon_overrides or {})
+        rids |= set(min_execution_horizon_overrides or {})
+        rids |= set(max_execution_horizon_overrides or {})
         rids |= barrier_robot_ids or set()
         if not rids:
             return None
@@ -449,9 +558,15 @@ class FleetDispatcher:
                 parts.append(f"--control-hz {float(control_hz_overrides[rid])}")
             if prompt_overrides and rid in prompt_overrides:
                 parts.append(f"--prompt {shlex.quote(prompt_overrides[rid])}")
-            if execution_horizon_overrides and rid in execution_horizon_overrides:
+            if min_execution_horizon_overrides and rid in min_execution_horizon_overrides:
                 parts.append(
-                    f"--execution-horizon {int(execution_horizon_overrides[rid])}"
+                    "--min-execution-horizon "
+                    f"{int(min_execution_horizon_overrides[rid])}"
+                )
+            if max_execution_horizon_overrides and rid in max_execution_horizon_overrides:
+                parts.append(
+                    "--max-execution-horizon "
+                    f"{int(max_execution_horizon_overrides[rid])}"
                 )
             if barrier_robot_ids and rid in barrier_robot_ids:
                 parts.append("--barrier")

@@ -1,0 +1,80 @@
+# Homogeneous 14-robot lego-sorting trial, long execution horizon.
+#
+# Same shape as het_lego_sort_homog.yaml but every station in the fleet and
+# max_execution_horizon 100 (vs 10). Longer chunks mean each robot executes
+# more actions per inference, so it asks the server for work less often --
+# the lever against the planner starvation the 10-robot run showed.
+#
+# Still needed even though the run is homogeneous: run_real's top-level
+# --control-hz / --max-execution-horizon are provenance-only, and there is no
+# --min-execution-horizon or --prompt flag at all. The het config is the only
+# channel that reaches the clients.
+#
+#   control_hz          -> --control-hz 30
+#   min/max horizon     -> --min-execution-horizon 5 / --max-execution-horizon 100
+#   language_index 0    -> --prompt "sort the red and blue legos into the correct bins"
+#                          (resolved via configs/real_task_index.json)
+
+control_hz:
+  1: 30
+  2: 30
+  3: 30
+  4: 30
+  5: 30
+  6: 30
+  7: 30
+  8: 30
+  9: 30
+  10: 30
+  11: 30
+  12: 30
+  13: 30
+  14: 30
+
+min_execution_horizon:
+  1: 5
+  2: 5
+  3: 5
+  4: 5
+  5: 5
+  6: 5
+  7: 5
+  8: 5
+  9: 5
+  10: 5
+  11: 5
+  12: 5
+  13: 5
+  14: 5
+
+max_execution_horizon:
+  1: 100
+  2: 100
+  3: 100
+  4: 100
+  5: 100
+  6: 100
+  7: 100
+  8: 100
+  9: 100
+  10: 100
+  11: 100
+  12: 100
+  13: 100
+  14: 100
+
+language_index:
+  1: 0
+  2: 0
+  3: 0
+  4: 0
+  5: 0
+  6: 0
+  7: 0
+  8: 0
+  9: 0
+  10: 0
+  11: 0
+  12: 0
+  13: 0
+  14: 0

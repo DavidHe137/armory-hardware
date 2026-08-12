@@ -5,13 +5,17 @@ Workflow:
   2. Filter to selected robots; require they're all reachable.
   3. ``FleetDispatcher.run_trial(...)`` → start clients, wait, kill (SIGINT
      with grace), SFTP each robot's RealSaver output back.
-  4. Optionally fetch ``server_metrics_history.json`` from the running
-     armory server (``/save-metrics``).
+  4. Optionally copy the server's own metrics files into ``<trial>/server/``
+     (``--server-metrics-dir``); the server writes them itself, so there is
+     nothing to fetch over HTTP.
   5. Run ``calculate_metrics`` and ``generate_all_plots`` on the assembled
      output dir — the same offline pass run_libero.py uses for sim.
 
 The on-disk layout RealSaver produces matches the sim Saver, so the metrics
 code parses the real output without modification.
+
+Needs an interpreter that can import ``evaluation.metrics`` for step 5 — i.e.
+one with ``armory[evaluation]`` installed, which pins Python >=3.11,<3.12.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import datetime
 import json
 import logging
 import pathlib
+import shutil
 import subprocess
 import sys
 import time
@@ -87,17 +92,20 @@ class Args:
     """If true, skip robots that aren't BOOTED before starting."""
 
     het_config_path: str | None = None
-    """Optional YAML with per-workstation launch overrides. Supports three
+    """Optional YAML with per-workstation launch overrides. Supports four
     top-level sections, all optional (must have at least one):
 
     ``control_hz: {<station_id>: <hz>, ...}`` — forwarded as ``--control-hz``.
     ``language_index: {<station_id>: <idx>, ...}`` — looked up in
     ``configs/real_task_index.json`` (override path with --task-index-path)
     and forwarded as ``--prompt <STRING>``.
-    ``execution_horizon: {<station_id>: <N>, ...}`` — forwarded as
-    ``--execution-horizon <N>``.
+    ``min_execution_horizon: {<station_id>: <N>, ...}`` and
+    ``max_execution_horizon: {<station_id>: <N>, ...}`` — forwarded as
+    ``--min-execution-horizon <N>`` / ``--max-execution-horizon <N>``.
 
-    See configs/experiments/edge_cases_real/*.yaml for examples."""
+    Any other top-level key is an error: an unrecognised section would
+    otherwise be dropped in silence and the trial would run homogeneous while
+    looking like it applied the config."""
 
     task_index_path: str | None = None
     """Path to the language-index → prompt JSON. Defaults to
@@ -107,18 +115,36 @@ class Args:
     #################################################################################
     # Server metrics (optional)
     #################################################################################
-    fetch_server_metrics: bool = True
-    """Pull /save-metrics from the running server too (enables Gantt + scheduler plots)."""
+    reset_server_metrics: bool = True
+    """POST /reset before the trial so the scheduler's in-flight state doesn't
+    carry over from the previous run."""
 
-    server_host: str | None = "localhost"
-    """Server host for /save-metrics. Set to None to skip the server fetch."""
+    server_host: str | None = None
+    """Host serving /reset. Defaults to the fleet config's policy host
+    (``ARMORY_POLICY_HOST``) — the same server the robots' tunnels point at.
+    Not ``localhost``: the fleet creates its SSH forwards *on the
+    workstations*, so nothing is listening on this machine's 8080 unless you
+    opened your own. Use --no-reset-server-metrics to skip."""
 
     server_port: int = 8080
+
+    server_metrics_dir: str | None = None
+    """Path to the policy server's metrics dir — ``<its output_dir>/server``,
+    which defaults to ``output/serve/server`` relative to wherever the server
+    was launched. Its contents (metadata.json, batches.jsonl, events.jsonl,
+    scheduler_decisions.jsonl) are copied into ``<trial>/server/``, where the
+    metrics pass looks for them; without it the batch/Gantt/scheduler plots
+    are skipped. Must be readable from *this* machine, so it only works when
+    the server writes somewhere shared — otherwise copy the dir across
+    yourself and point the metrics pass at the trial afterwards.
+
+    There is no HTTP fetch: the old ``/save-metrics`` endpoint is gone, and
+    the server now writes these files itself."""
 
     #################################################################################
     # Trial provenance
     #################################################################################
-    control_hz: int = 20
+    control_hz: int = 30
     """Used only to estimate max_steps in runtime_metadata.json."""
 
     broker_type: str = "naive_async"
@@ -167,28 +193,45 @@ def _default_task_index_path() -> str:
     return str(here.parent / "configs" / "real_task_index.json")
 
 
-def _load_het_config(
-    path: str,
-) -> tuple[dict[int, int], dict[int, int], dict[int, int]]:
+HET_SECTIONS = (
+    "control_hz",
+    "language_index",
+    "min_execution_horizon",
+    "max_execution_horizon",
+)
+
+
+def _load_het_config(path: str) -> dict[str, dict[int, int]]:
     """Parse the heterogeneous per-robot launch YAML.
 
-    Schema (all sections optional, at least one required):
-      ``control_hz: {<station_id>: <hz>, ...}``
-      ``language_index: {<station_id>: <task_idx>, ...}``
-      ``execution_horizon: {<station_id>: <N>, ...}``
+    Schema (all sections optional, at least one required), keyed by station id:
+      ``control_hz``, ``language_index``,
+      ``min_execution_horizon``, ``max_execution_horizon``
 
-    Returns ``(control_hz_map, language_index_map, execution_horizon_map)``
-    with ints on both sides. Language indices are returned as-is here;
-    resolution against real_task_index.json happens in ``main()``.
+    Returns ``{section: {station_id: value}}`` with ints on both sides, one
+    entry per section in ``HET_SECTIONS`` (empty dict when absent). Language
+    indices are returned as-is; resolution against real_task_index.json happens
+    in ``main()``.
+
+    Unknown sections are rejected rather than ignored. The horizon sections
+    were once parsed under a different name, and because the file still had a
+    ``control_hz`` section to satisfy the at-least-one check, configs whose
+    entire fast/slow split lived in the horizons parsed clean and ran
+    homogeneous.
     """
     raw = yaml.safe_load(pathlib.Path(path).read_text())
     if not isinstance(raw, dict):
         sys.exit(f"het config {path}: top-level must be a mapping")
-    known_sections = ("control_hz", "language_index", "execution_horizon")
-    if not any(s in raw for s in known_sections):
+    unknown = sorted(set(raw) - set(HET_SECTIONS))
+    if unknown:
+        sys.exit(
+            f"het config {path}: unknown section(s) {', '.join(repr(s) for s in unknown)} — "
+            f"known sections are {', '.join(repr(s) for s in HET_SECTIONS)}"
+        )
+    if not any(s in raw for s in HET_SECTIONS):
         sys.exit(
             f"het config {path}: must define at least one of "
-            f"{', '.join(repr(s) for s in known_sections)}"
+            f"{', '.join(repr(s) for s in HET_SECTIONS)}"
         )
 
     def _parse_int_int(section: str) -> dict[int, int]:
@@ -205,11 +248,7 @@ def _load_het_config(
                 sys.exit(f"het config {path}: bad {section} entry {k!r}: {v!r} (need int → int)")
         return out
 
-    return (
-        _parse_int_int("control_hz"),
-        _parse_int_int("language_index"),
-        _parse_int_int("execution_horizon"),
-    )
+    return {section: _parse_int_int(section) for section in HET_SECTIONS}
 
 
 def _load_task_index(path: str) -> dict[int, str]:
@@ -252,7 +291,22 @@ def _filter_to_booted(fleet: FleetController, targets: list, timeout_sec: float 
     return eligible
 
 
-def _write_experiment_args(out: pathlib.Path, robots: list, args: Args) -> None:
+def _write_experiment_args(
+    out: pathlib.Path,
+    robots: list,
+    args: Args,
+    het: dict[str, dict[int, int]] | None = None,
+) -> None:
+    """Record what this trial was actually launched with, per robot.
+
+    The horizons and control rate come from the het config when it sets them,
+    falling back to the ``Args`` defaults otherwise — a flat provenance record
+    would describe a homogeneous run no matter what the robots were told.
+    """
+    het = het or {}
+    het_hz = het.get("control_hz") or {}
+    het_min = het.get("min_execution_horizon") or {}
+    het_max = het.get("max_execution_horizon") or {}
     estimated_max_steps = int(round(args.duration_sec * args.control_hz))
     data = {
         "experiment_config": {
@@ -264,28 +318,76 @@ def _write_experiment_args(out: pathlib.Path, robots: list, args: Args) -> None:
             "num_robots": len(robots),
             "control_hz": args.control_hz,
             "broker_type": args.broker_type,
-            "execution_horizons": [{"min": 0, "max": args.max_execution_horizon}] * len(robots),
+            "execution_horizons": [
+                {
+                    "min": het_min.get(r.id, 0),
+                    "max": het_max.get(r.id, args.max_execution_horizon),
+                }
+                for r in robots
+            ],
         },
         "duration_sec": args.duration_sec,
         "output_dir": str(out),
         "robots": [r.name for r in robots],
+        "per_robot": [
+            {
+                "workstation_id": r.id,
+                "robot_name": r.name,
+                "control_hz": het_hz.get(r.id, args.control_hz),
+                "min_execution_horizon": het_min.get(r.id, 0),
+                "max_execution_horizon": het_max.get(r.id, args.max_execution_horizon),
+            }
+            for r in robots
+        ],
     }
     (out / "experiment_args.json").write_text(json.dumps(data, indent=2))
 
 
-def _fetch_server_metrics(args: Args, out: pathlib.Path) -> None:
-    url = f"http://{args.server_host}:{args.server_port}/save-metrics"
-    try:
-        resp = requests.get(url, timeout=30.0)
-        resp.raise_for_status()
-        (out / "server_metrics_history.json").write_text(json.dumps(resp.json(), indent=2))
-        logger.info("saved server metrics history to %s", out / "server_metrics_history.json")
-    except Exception as e:
-        logger.warning("could not fetch server metrics from %s: %s", url, e)
+SERVER_METRICS_FILES = (
+    "metadata.json",
+    "batches.jsonl",
+    "events.jsonl",
+    "scheduler_decisions.jsonl",
+)
 
 
-def _reset_server_metrics(args: Args) -> None:
-    url = f"http://{args.server_host}:{args.server_port}/reset"
+def _copy_server_metrics(src_dir: str, out: pathlib.Path) -> None:
+    """Copy the server's metrics files into ``<out>/server/``.
+
+    That is the layout ``evaluation.metrics`` reads: ``load_server_metadata``
+    and the batch/event/decision loaders all resolve ``<trial>/server/<file>``.
+
+    Note the jsonl logs are opened ``"w"`` when the *server process* starts and
+    are not truncated by ``/reset``, so back-to-back trials against one server
+    each copy a cumulative log, not a per-trial slice. Splitting them means
+    restarting the server between trials or slicing by timestamp after.
+    """
+    src = pathlib.Path(src_dir)
+    if not src.is_dir():
+        logger.warning(
+            "server metrics dir %s not readable from this machine — skipping "
+            "(batch/Gantt/scheduler plots will be absent)",
+            src,
+        )
+        return
+    dest = out / "server"
+    dest.mkdir(parents=True, exist_ok=True)
+    copied, missing = [], []
+    for name in SERVER_METRICS_FILES:
+        path = src / name
+        if not path.is_file():
+            missing.append(name)
+            continue
+        shutil.copy2(path, dest / name)
+        copied.append(name)
+    if copied:
+        logger.info("copied server metrics %s -> %s", copied, dest)
+    if missing:
+        logger.warning("server metrics dir %s had no %s", src, missing)
+
+
+def _reset_server_metrics(args: Args, host: str) -> None:
+    url = f"http://{host}:{args.server_port}/reset"
     try:
         requests.post(url, timeout=5.0)
         logger.info("reset server metrics at %s", url)
@@ -305,7 +407,17 @@ def _start_webcam_recorders(
     fail fast if the path isn't being published. ``-c copy`` skips re-encoding,
     so the recorder is cheap.
 
-    Returns ``[(robot, popen, log_file), ...]`` for ``_stop_webcam_recorders``.
+    Written as *fragmented* mp4. A plain mp4 keeps its moov atom in memory and
+    writes it only at the end, so a recorder that dies without finalizing
+    leaves ftyp+free+mdat and an unplayable file — and this ffmpeg build
+    (imageio-ffmpeg's static v7.0.2) installs SIGINT/SIGTERM handlers but does
+    not act on them, so every recorder *does* die that way, on the SIGKILL at
+    the end of ``_stop_webcam_recorders``. Fragmenting writes an empty moov up
+    front and self-contained moof+mdat fragments at each keyframe, so the file
+    on disk is playable no matter how the process exits. ``-g 15`` on the
+    publisher puts a keyframe every 0.5s, bounding what a kill can lose.
+
+    Returns ``[(robot, popen), ...]`` for ``_stop_webcam_recorders``.
     """
     videos_dir = out_dir / "videos"
     videos_dir.mkdir(parents=True, exist_ok=True)
@@ -326,6 +438,8 @@ def _start_webcam_recorders(
             url,
             "-c",
             "copy",
+            "-movflags",
+            "+frag_keyframe+empty_moov+default_base_moof",
             "-y",
             str(mp4),
         ]
@@ -343,11 +457,16 @@ def _start_webcam_recorders(
 def _request_recorder_stop(procs: list) -> None:
     """Send SIGTERM to each running ffmpeg recorder. Non-blocking.
 
-    ffmpeg flushes the mp4 trailer on SIGTERM but takes a moment to actually
-    exit; pair with ``_stop_webcam_recorders`` (idempotent on already-signaled
-    procs) to actually wait for them and SIGKILL stragglers. Splitting the
-    two lets the trial-end callback fire SIGTERM at the kill instant without
-    blocking the fleet event loop on ffmpeg's grace period.
+    Best-effort only: the pinned ffmpeg build catches SIGTERM but keeps
+    running, so in practice the recorders are reaped by the SIGKILL in
+    ``_stop_webcam_recorders``. That is safe because the output is fragmented
+    mp4 (see ``_start_webcam_recorders``) — the file is playable either way.
+    Sending it here anyway bounds the recording at the trial window on any
+    build that does honour the signal.
+
+    Splitting this from ``_stop_webcam_recorders`` (idempotent on
+    already-signaled procs) lets the trial-end callback signal at the kill
+    instant without blocking the fleet event loop on the grace period.
     """
     for _, proc in procs:
         if proc.poll() is None:
@@ -358,10 +477,13 @@ def _stop_webcam_recorders(
     procs: list,
     grace_sec: float = WEBCAM_RECORDER_GRACE_SEC,
 ) -> None:
-    """SIGTERM each recorder so ffmpeg flushes the mp4 trailer; SIGKILL on timeout.
+    """SIGTERM each recorder, then SIGKILL whatever is still up after ``grace_sec``.
 
-    ffmpeg writes the moov atom on graceful exit; a SIGKILL would leave the
-    file un-finalized, so we give each process ``grace_sec`` to wind down.
+    The deadline is shared across all recorders on purpose: they shut down
+    concurrently, so the budget is wall-clock from the SIGTERM, not per
+    process. Reaching it is the normal path rather than an error — the pinned
+    ffmpeg ignores both signals — and the fragmented-mp4 output means a killed
+    recorder still leaves a playable file.
     """
     if not procs:
         return
@@ -381,8 +503,12 @@ def _stop_webcam_recorders(
             )
             proc.kill()
             proc.wait()
-        # ffmpeg returns 255 on signal-driven exit; treat that as success too.
-        if proc.returncode in (0, 255):
+        # Expected exits: 0, ffmpeg's own 255 on signal-driven teardown, and a
+        # negative code (Popen's encoding of "died on signal N") for the
+        # SIGTERM/SIGKILL path that is the norm here. Anything else is a real
+        # failure — most often a publisher that was never streaming, which is
+        # the case worth a warning since it yields an empty file.
+        if proc.returncode in (0, 255) or proc.returncode < 0:
             logger.info("recorder WS-%d finished (rc=%d)", robot.id, proc.returncode)
         else:
             logger.warning(
@@ -482,6 +608,14 @@ def main(args: Args) -> None:
             if not targets:
                 sys.exit("no eligible (BOOTED/ONLINE) robots — boot the fleet first")
 
+        het: dict[str, dict[int, int]] = {section: {} for section in HET_SECTIONS}
+        if args.het_config_path:
+            het = _load_het_config(args.het_config_path)
+        het_hz = het["control_hz"]
+        het_lang = het["language_index"]
+        het_min_exec = het["min_execution_horizon"]
+        het_max_exec = het["max_execution_horizon"]
+
         ts = datetime.datetime.now(tz=datetime.UTC).strftime("%Y%m%d_%H%M%S")
         out = args.output_dir / f"trial_{ts}"
         out.mkdir(parents=True, exist_ok=True)
@@ -492,33 +626,30 @@ def main(args: Args) -> None:
             [f"WS-{r.id}/{r.name}" for r in targets],
         )
 
-        _write_experiment_args(out, targets, args)
+        _write_experiment_args(out, targets, args, het)
 
-        # Reset server metrics so the snapshot we fetch matches this trial.
-        if args.fetch_server_metrics and args.server_host:
-            _reset_server_metrics(args)
+        server_host = args.server_host or cfg.policy_host
+        if args.reset_server_metrics and not server_host:
+            logger.warning(
+                "skipping server reset: no --server-host and no policy host in "
+                "the fleet config (set ARMORY_POLICY_HOST in .env)"
+            )
 
-        het_hz: dict[int, int] = {}
-        het_lang: dict[int, int] = {}
-        het_exec: dict[int, int] = {}
-        if args.het_config_path:
-            het_hz, het_lang, het_exec = _load_het_config(args.het_config_path)
+        # Clear the scheduler's carry-over state so this trial starts clean.
+        if args.reset_server_metrics and server_host:
+            _reset_server_metrics(args, server_host)
 
         target_ids = {r.id for r in targets}
-        if het_hz:
-            applied = {rid: het_hz[rid] for rid in het_hz if rid in target_ids}
-            unmatched = sorted(set(het_hz) - target_ids)
-            logger.info("control_hz overrides applied: %s", applied)
+        for section in ("control_hz", "min_execution_horizon", "max_execution_horizon"):
+            mapping = het[section]
+            if not mapping:
+                continue
+            applied = {rid: mapping[rid] for rid in mapping if rid in target_ids}
+            unmatched = sorted(set(mapping) - target_ids)
+            logger.info("%s overrides applied: %s", section, applied)
             if unmatched:
-                logger.warning("control_hz config has entries for non-target ids: %s", unmatched)
-        if het_exec:
-            applied_exec = {rid: het_exec[rid] for rid in het_exec if rid in target_ids}
-            unmatched_exec = sorted(set(het_exec) - target_ids)
-            logger.info("execution_horizon overrides applied: %s", applied_exec)
-            if unmatched_exec:
                 logger.warning(
-                    "execution_horizon config has entries for non-target ids: %s",
-                    unmatched_exec,
+                    "%s config has entries for non-target ids: %s", section, unmatched
                 )
 
         prompt_overrides: dict[int, str] = {}
@@ -569,7 +700,8 @@ def main(args: Args) -> None:
             remote_subdir=args.remote_subdir,
             control_hz_overrides=het_hz or None,
             prompt_overrides=prompt_overrides or None,
-            execution_horizon_overrides=het_exec or None,
+            min_execution_horizon_overrides=het_min_exec or None,
+            max_execution_horizon_overrides=het_max_exec or None,
             on_clients_running=_on_clients_running,
             on_clients_stopping=_on_clients_stopping,
         )
@@ -610,19 +742,21 @@ def main(args: Args) -> None:
             else:
                 logger.info("  %s: %s", stage, results)
 
-        # Pull the server's metrics snapshot if requested.
-        if args.fetch_server_metrics and args.server_host:
-            _fetch_server_metrics(args, out)
+        # Collect the server's own metrics files, if they're reachable.
+        if args.server_metrics_dir:
+            _copy_server_metrics(args.server_metrics_dir, out)
 
         # Restructure: each robot's data landed under <out>/<robot.name>/<robot_idx>/...
         # but calculate_metrics expects <out>/<robot_idx>/... directly.
-        # _fetch_one_robot writes to <local_dir>/<robot_name>/<remote_subdir>/<robot_idx>/...
+        # _fetch_one_robot mgets the trial's remote directory, so it writes to
+        # <local_dir>/<robot_name>/<trial_id>/<robot_idx>/... — the nested level
+        # is named for the leaf of the remote path, which is the trial id.
         # Flatten: hoist the per-robot trees so the metrics pass sees the layout it expects.
-        _flatten_fetched_layout(out, args.remote_subdir)
+        _flatten_fetched_layout(out, out.name)
 
         # Finally: same offline metrics pass as run_libero.py.
         try:
-            from armory_evaluation.sims.libero.metrics import calculate_metrics, generate_all_plots
+            from evaluation.metrics import calculate_metrics, generate_all_plots
 
             calculate_metrics(out)
             generate_all_plots(out)
@@ -636,17 +770,18 @@ def main(args: Args) -> None:
         fleet.stop()
 
 
-def _flatten_fetched_layout(out: pathlib.Path, remote_subdir: str) -> None:
+def _flatten_fetched_layout(out: pathlib.Path, nested_name: str) -> None:
     """Lift per-robot episode trees so calculate_metrics sees <out>/<robot_idx>/.
 
-    fetch lands data at <out>/<robot.name>/<remote_subdir>/<robot_idx>/<episode>/.
+    fetch lands data at <out>/<robot.name>/<nested_name>/<robot_idx>/<episode>/,
+    where <nested_name> is the leaf of the remote path SFTP copied — the trial id.
     Move <robot_idx> up so the layout matches the sim Saver: <out>/<robot_idx>/<episode>/.
     """
     for robot_dir in list(out.iterdir()):
         if not robot_dir.is_dir():
             continue
         # Skip already-flattened or non-fetched dirs (e.g. server_metrics dir).
-        nested_root = robot_dir / remote_subdir.lstrip("/")
+        nested_root = robot_dir / nested_name.lstrip("/")
         if not nested_root.is_dir():
             continue
         for robot_idx_dir in list(nested_root.iterdir()):

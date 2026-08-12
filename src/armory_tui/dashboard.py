@@ -102,6 +102,9 @@ class Dashboard:
         self._op_token = 0
         self._op_future = None
         self._op_state: dict | None = None
+        # Work handed back from a fleet callback to the curses thread; see
+        # `_defer`.
+        self._deferred: list = []
         # Rows scrolled up from the newest entry; 0 means "follow the tail".
         self._log_scroll = 0
         self._log_rows_total = 0
@@ -129,6 +132,7 @@ class Dashboard:
 
         while True:
             try:
+                self._drain_deferred()
                 self._render()
                 key = stdscr.getch()
                 if key == -1:
@@ -143,6 +147,28 @@ class Dashboard:
                     break
             except KeyboardInterrupt:
                 break
+
+    # ── deferred work ───────────────────────────────────────────
+
+    def _defer(self, action):
+        """Queue `action` to run on the curses thread.
+
+        Fleet callbacks land on the dispatcher's asyncio thread, which must not
+        touch curses — the main loop is drawing from the other thread and the
+        two corrupt each other's screen state. Anything a callback wants to do
+        that involves a dialog goes through here and runs on the next loop pass.
+        """
+        with self._lock:
+            self._deferred.append(action)
+
+    def _drain_deferred(self):
+        with self._lock:
+            pending, self._deferred = self._deferred, []
+        for action in pending:
+            try:
+                action()
+            except Exception as e:
+                self._log(f"Deferred action failed: {e}")
 
     # ── input handling ──────────────────────────────────────────
 
@@ -236,13 +262,13 @@ class Dashboard:
                 "Build Workspace", self.dispatcher.build_workspace
             )
         elif ch == "1":
-            self._broadcast_with_confirm("Enable", self.dispatcher.enable)
+            self._do_guarded_motion("Enable", self.dispatcher.enable)
         elif ch == "2":
-            self._broadcast_with_confirm("Disable", self.dispatcher.disable)
+            self._do_guarded_motion("Disable", self.dispatcher.disable)
         elif ch == "3":
-            self._broadcast_with_confirm("Goto Init", self.dispatcher.goto_init)
+            self._do_guarded_motion("Goto Init", self.dispatcher.goto_init)
         elif ch == "4":
-            self._broadcast_with_confirm("Goto Zero", self.dispatcher.goto_zero)
+            self._do_guarded_motion("Goto Zero", self.dispatcher.goto_zero)
         elif ch == "5":
             self._do_connect_to_server()
         elif ch == "6":
@@ -376,6 +402,9 @@ class Dashboard:
             self._op_name = ""
             self._op_future = None
             self._op_state = None
+            # An abandoned preflight must not leave a queued follow-up behind:
+            # aborting 'Disable preflight' cannot go on to run Disable.
+            self._deferred.clear()
 
         self._log(
             f"Aborted '{name}'. "
@@ -432,6 +461,9 @@ class Dashboard:
             self._log(f"{name} cancelled.")
             return
 
+        self._run_broadcast(name, action_fn, targets)
+
+    def _run_broadcast(self, name: str, action_fn, targets: list):
         self._start_operation(
             name,
             lambda done: action_fn(targets, callback=done),
@@ -442,6 +474,206 @@ class Dashboard:
     def _on_broadcast_done(self, name: str):
         self._announce_runtime_state()
         self._log(f"'{name}' complete.")
+
+    # ── arm-motion guard ────────────────────────────────────────
+
+    def _do_guarded_motion(
+        self,
+        name: str,
+        action_fn,
+        allow_stop: bool = True,
+        skip_confirm: bool = False,
+    ):
+        """Run an arm-motion broadcast, but never onto a live client/follower.
+
+        Every command routed through here ends up driving the arm — Disable
+        opens with ``p goto reset``, Enable closes with ``p goto init`` — so a
+        client or follower that is still running would be commanding the same
+        joints from the other side. The two fight, and the arm is the thing that
+        loses.
+
+        The dashboard's cached client-running set is not good enough to gate on:
+        it is refreshed on a schedule and says nothing about the follower. So
+        the state is re-read from the workstations first, and only a clean
+        preflight reaches the arms. When something is running the operator gets
+        the choice of stopping it first, and that path re-checks (with
+        ``allow_stop=False``) rather than assuming the kill worked.
+        """
+        targets = self._eligible_targets("runtime", self._command_targets())
+        if not targets:
+            self._set_notice(f"'{name}' needs booted or online targets.")
+            self._log(f"No eligible robot(s) for '{name}'.")
+            return
+
+        # The preflight results reach us through `holder` rather than through
+        # `done(results)`: _start_operation logs whatever it is handed, and a
+        # per-robot dict on a 14-robot fleet would bury the log.
+        holder: dict = {}
+
+        def launch(done):
+            def on_check(results=None):
+                holder["results"] = results or {}
+                done()
+
+            return self.dispatcher.check_runtime_processes(targets, callback=on_check)
+
+        self._start_operation(
+            f"{name} preflight",
+            launch,
+            start_message=(
+                f"Checking for running clients/followers before '{name}' on "
+                f"{self._target_label(targets)}..."
+            ),
+            on_results=lambda _results: self._defer(
+                lambda: self._resolve_motion_guard(
+                    name,
+                    action_fn,
+                    targets,
+                    holder.get("results", {}),
+                    allow_stop=allow_stop,
+                    skip_confirm=skip_confirm,
+                )
+            ),
+        )
+
+    def _resolve_motion_guard(
+        self,
+        name: str,
+        action_fn,
+        targets: list,
+        results: dict,
+        allow_stop: bool,
+        skip_confirm: bool,
+    ):
+        """Decide what the preflight result means. Runs on the curses thread."""
+        # The listener is the run_follower.launch.py process; the operator calls
+        # it the follower, so that is what the blocked dialog names.
+        labels = (("client", "client"), ("listener", "follower"))
+        blocked: dict[int, list[str]] = {}
+        for robot in targets:
+            state = results.get(robot.id) or {}
+            running = [label for key, label in labels if state.get(key)]
+            if running:
+                blocked[robot.id] = running
+
+        if not blocked:
+            if not skip_confirm and not self._confirm(
+                f"Execute '{name}' on {self._target_label(targets)}?"
+            ):
+                self._log(f"{name} cancelled.")
+                return
+            self._run_broadcast(name, action_fn, targets)
+            return
+
+        detail = ", ".join(
+            f"WS-{rid} ({'+'.join(procs)})" for rid, procs in sorted(blocked.items())
+        )
+        blocked_robots = self._robots_for_ids(set(blocked))
+
+        if not allow_stop:
+            # Second pass: the operator already asked for the stop and it did
+            # not take. Refuse rather than offer the same button again.
+            self._set_notice(f"'{name}' aborted — processes survived the stop.")
+            self._log(
+                f"'{name}' aborted: still running after the stop — {detail}. "
+                "Nothing was sent to the arms. Try [8] Kill All."
+            )
+            return
+
+        self._log(f"'{name}' blocked — still running: {detail}.")
+        if self._motion_guard_menu(name, detail) != "stop":
+            self._set_notice(f"'{name}' cancelled — client/follower still running.")
+            self._log(f"{name} cancelled; nothing was sent to the arms.")
+            return
+
+        self._stop_then_run(name, action_fn, targets, blocked_robots)
+
+    def _stop_then_run(self, name: str, action_fn, targets: list, blocked: list):
+        """Stop the clients/followers in the way, then re-run the guard."""
+
+        def on_results(_results=None):
+            self._refresh_client_status()
+            self._defer(
+                lambda: self._do_guarded_motion(
+                    name, action_fn, allow_stop=False, skip_confirm=True
+                )
+            )
+
+        self._start_operation(
+            f"Stop client/follower before {name}",
+            lambda done: self.dispatcher.stop_runtime_processes(
+                blocked, callback=done
+            ),
+            start_message=(
+                "Stopping clients and followers on "
+                f"{self._format_robot_ids(blocked)} before '{name}'..."
+            ),
+            on_results=on_results,
+        )
+
+    def _motion_guard_menu(self, name: str, detail: str) -> str:
+        """Blocked-command dialog. Returns "stop" or "cancel".
+
+        There is deliberately no "run anyway": the whole point of the guard is
+        that this command must not reach an arm something else is driving.
+        """
+        stdscr = self._stdscr
+        h, w = stdscr.getmaxyx()
+        box_w = min(max(52, len(detail) + 8), w - 6)
+        box_h = 9
+        start_y = max(1, h // 2 - box_h // 2)
+        start_x = max(2, w // 2 - box_w // 2)
+        win = curses.newwin(box_h, box_w, start_y, start_x)
+        win.bkgd(" ", curses.color_pair(PAIR_SURFACE))
+
+        stdscr.nodelay(False)
+        try:
+            while True:
+                win.erase()
+                win.bkgd(" ", curses.color_pair(PAIR_SURFACE))
+                self._draw_box(win, 0, 0, box_h, box_w, f"'{name}' Blocked")
+                self._center_text(
+                    win,
+                    2,
+                    1,
+                    box_w - 2,
+                    "Still running:",
+                    curses.color_pair(PAIR_LOG),
+                )
+                self._center_text(
+                    win,
+                    3,
+                    1,
+                    box_w - 2,
+                    detail,
+                    curses.color_pair(PAIR_LOG) | curses.A_BOLD,
+                )
+                self._center_text(
+                    win,
+                    5,
+                    1,
+                    box_w - 2,
+                    f"[K] Stop them, then {name}",
+                    curses.color_pair(PAIR_NOTICE),
+                )
+                self._center_text(
+                    win,
+                    6,
+                    1,
+                    box_w - 2,
+                    "[C] Cancel",
+                    curses.color_pair(PAIR_NOTICE),
+                )
+                win.refresh()
+
+                key = stdscr.getch()
+                ch = chr(key).upper() if 0 <= key < 256 else ""
+                if ch == "K":
+                    return "stop"
+                if ch in ("C", "N", "Q") or key == 27:
+                    return "cancel"
+        finally:
+            stdscr.nodelay(True)
 
     def _do_boot(self):
         """Boot selected robots, or all robots when none are selected."""

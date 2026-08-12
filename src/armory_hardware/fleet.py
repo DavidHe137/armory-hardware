@@ -29,8 +29,12 @@ from armory_hardware.config import FleetConfig, Robot, RobotStatus
 DOCKER_CONTAINER = "piper_env"
 DATA_COLLECTION_DIR = "/CS4803ARM_Lab/user_data/data_collection"
 PIPER_WORKSPACE_DIR = "/CS4803ARM_Lab/user_data/piper_ros"
-# Default data dir written by RealSaver inside the container (bind-mounted to the
-# workstation host). Override via the run_trial(remote_subdir=...) parameter.
+# Where the workstation's episode store is mounted inside the container. The host
+# side is FleetConfig.episode_host_root, so container path and fetch path are two
+# views of one directory.
+EPISODE_CONTAINER_ROOT = "/datasets"
+# Default data dir written by RealSaver, relative to both roots above. Override via
+# the run_trial(remote_subdir=...) parameter.
 DEFAULT_EPISODE_SUBDIR = "armory_episodes"
 
 # Sentinel files used by the trial startup barrier (see FleetDispatcher._run_trial
@@ -309,15 +313,25 @@ class FleetController:
         robots: list[Robot],
         callback: Callable | None = None,
         extra_args_per_robot: dict[int, str] | None = None,
+        episode_dir: str = "",
     ):
         """Start the Piper client node inside Docker.
 
         ``extra_args_per_robot`` maps workstation id to a string appended
         verbatim to the launch command (e.g.
         ``{14: "--ros-args -p control_hz:=20"}``).
+
+        ``episode_dir`` is the container-side directory RealSaver writes to;
+        empty leaves the node's own default. Trials pass a per-trial path (see
+        ``episode_container_dir``) so no two trials share an episode tree.
         """
         return self.submit(
-            self._start_clients(robots, callback, extra_args_per_robot=extra_args_per_robot)
+            self._start_clients(
+                robots,
+                callback,
+                extra_args_per_robot=extra_args_per_robot,
+                episode_dir=episode_dir,
+            )
         )
 
     def kill_data_listeners(
@@ -350,6 +364,14 @@ class FleetController:
         """Check whether Piper client nodes are running inside Docker."""
         return self.submit(self._check_clients(robots, callback))
 
+    def check_data_listeners(
+        self,
+        robots: list[Robot],
+        callback: Callable | None = None,
+    ):
+        """Check whether data listeners (followers) are running inside Docker."""
+        return self.submit(self._check_data_listeners(robots, callback))
+
     def fetch_episode_data(
         self,
         robots: list[Robot],
@@ -357,16 +379,19 @@ class FleetController:
         remote_subdir: str = DEFAULT_EPISODE_SUBDIR,
         include_video: bool = False,
         callback: Callable | None = None,
+        trial_id: str = "",
     ):
         """Pull each robot's episode tree to ``local_dir/<robot_name>/`` via SFTP.
 
-        ``remote_subdir`` is a path relative to the workstation's user_data
-        bind mount (host side of /CS4803ARM_Lab/user_data/). Default
-        ``armory_episodes`` matches RealSaver's default.
+        ``remote_subdir`` is a path relative to the workstation's episode store
+        (``FleetConfig.episode_host_root``, the host side of the container's
+        ``/datasets``). Default ``armory_episodes`` matches RealSaver's default.
+        ``trial_id``, when set, narrows the fetch to that trial's subtree —
+        the same path the client was launched with.
         """
         return self.submit(
             self._fetch_episode_data(
-                robots, local_dir, remote_subdir, include_video, callback
+                robots, local_dir, remote_subdir, include_video, callback, trial_id
             )
         )
 
@@ -617,7 +642,7 @@ class FleetController:
             f" --mount type=bind,source={piper_root}/user_data,target=/CS4803ARM_Lab/user_data"
             f" --mount type=bind,source={piper_root}/assets,target=/CS4803ARM_Lab/assets"
             f" --mount type=bind,source={piper_root}/user_data/piper_ros,target=/piper_ros"
-            " -v /home/data_collection/dhe83/:/datasets/"
+            f" -v {shlex.quote(self.config.episode_host_root)}/:{EPISODE_CONTAINER_ROOT}/"
             " -v /dev:/dev"
             " -w /CS4803ARM_Lab/user_data/data_collection"
             " firefall/cluster_piper_env:v2"
@@ -1301,35 +1326,65 @@ class FleetController:
             callback=callback,
         )
 
-    def _policy_ros_args(self) -> str:
-        """``--ros-args`` overriding the client node's policy endpoint.
+    def episode_container_dir(
+        self,
+        remote_subdir: str = DEFAULT_EPISODE_SUBDIR,
+        trial_id: str = "",
+    ) -> str:
+        """Where RealSaver should write, as the container sees it."""
+        parts = [EPISODE_CONTAINER_ROOT, remote_subdir.strip("/")]
+        if trial_id:
+            parts.append(trial_id.strip("/"))
+        return "/".join(p for p in parts if p)
 
-        The node declares ``host``/``port`` as ROS parameters defaulting to
-        ``localhost:8080``, which only resolves when the SSH tunnel is
-        forwarding that port. Pointing the parameters straight at the policy
-        server removes the tunnel from the path entirely.
+    def episode_host_dir(
+        self,
+        remote_subdir: str = DEFAULT_EPISODE_SUBDIR,
+        trial_id: str = "",
+    ) -> str:
+        """The same directory as ``episode_container_dir``, on the workstation host."""
+        parts = [self.config.episode_host_root, remote_subdir.strip("/")]
+        if trial_id:
+            parts.append(trial_id.strip("/"))
+        return "/".join(p for p in parts if p)
+
+    def _client_ros_args(self, episode_dir: str = "") -> str:
+        """``--ros-args`` overriding the client node's ROS parameters.
+
+        Two of them. ``host``/``port`` default to ``localhost:8080``, which only
+        resolves when the SSH tunnel is forwarding that port; pointing them
+        straight at the policy server removes the tunnel from the path entirely.
+        ``data_dir`` defaults to the one shared episode directory, which every
+        trial then writes into under the same episode-index-derived folder name
+        — so trial N silently overwrote trial N-1, and a robot that produced
+        nothing this trial still had last trial's episode sitting there to be
+        fetched. A per-trial ``data_dir`` gives each trial its own tree.
 
         ``rclpy`` merges command-line parameter overrides with the explicit
         ``parameter_overrides`` the node's ``main`` builds from its own flags,
-        and that list never contains ``host``/``port`` — so this cannot collide
-        with ``--prompt``/``--control-hz``/``--barrier``.
+        and that list never contains ``host``/``port``/``data_dir`` — so this
+        cannot collide with ``--prompt``/``--control-hz``/``--barrier``.
 
-        Empty when no host is configured, which leaves the node's built-in
-        default (and therefore the tunnel workflow) untouched.
+        Empty when neither is configured, which leaves the node's built-in
+        defaults (and therefore the tunnel workflow) untouched.
         """
+        params = []
         host = self.config.policy_host.strip()
-        if not host:
+        if host:
+            params.append(f"-p host:={shlex.quote(host)}")
+            params.append(f"-p port:={int(self.config.policy_port)}")
+        if episode_dir:
+            params.append(f"-p data_dir:={shlex.quote(episode_dir)}")
+        if not params:
             return ""
-        return (
-            f"--ros-args -p host:={shlex.quote(host)} "
-            f"-p port:={int(self.config.policy_port)}"
-        )
+        return "--ros-args " + " ".join(params)
 
     async def _start_clients(
         self,
         robots: list[Robot],
         callback: Callable | None = None,
         extra_args_per_robot: dict[int, str] | None = None,
+        episode_dir: str = "",
     ):
         return await self._start_detached_docker_processes(
             robots,
@@ -1339,7 +1394,7 @@ class FleetController:
             log_suffix="client",
             callback=callback,
             extra_args_per_robot=extra_args_per_robot,
-            trailing_args=self._policy_ros_args(),
+            trailing_args=self._client_ros_args(episode_dir),
         )
 
     async def _kill_data_listeners(
@@ -1380,6 +1435,20 @@ class FleetController:
             robots,
             command="ros2 run piper piper_client_armory",
             log_suffix="client",
+            callback=callback,
+        )
+
+    async def _check_data_listeners(
+        self,
+        robots: list[Robot],
+        callback: Callable | None = None,
+    ):
+        # Same command string as _kill_data_listeners, so the check and the kill
+        # can never disagree about what "the listener" is.
+        return await self._check_detached_docker_processes(
+            robots,
+            command="ros2 launch run_follower.launch.py",
+            log_suffix="listener",
             callback=callback,
         )
 
@@ -1823,11 +1892,14 @@ class FleetController:
         remote_subdir: str,
         include_video: bool,
         callback: Callable | None,
+        trial_id: str = "",
     ) -> dict[int, str]:
         local_dir = pathlib.Path(local_dir)
         local_dir.mkdir(parents=True, exist_ok=True)
         tasks = [
-            self._fetch_one_robot(robot, local_dir, remote_subdir, include_video)
+            self._fetch_one_robot(
+                robot, local_dir, remote_subdir, include_video, trial_id
+            )
             for robot in robots
         ]
         outputs = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1846,6 +1918,7 @@ class FleetController:
         local_dir: pathlib.Path,
         remote_subdir: str,
         include_video: bool,
+        trial_id: str = "",
     ) -> str:
         logger = self._loggers[robot.id]
         try:
@@ -1854,8 +1927,11 @@ class FleetController:
             self._emit(f"WS-{robot.id}: fetch FAILED — {e}")
             return f"ERROR: {e}"
 
-        # remote_root = os.path.join(user_data, remote_subdir.lstrip("/"))
-        remote_root = "/home/data_collection/dhe83/armory_episodes"
+        # Host side of the container's /datasets mount, so this is the same
+        # directory the client node was told to write to. Derived, never
+        # hardcoded: a fetch root that drifts from the mount is indistinguishable
+        # from a trial that produced no data.
+        remote_root = self.episode_host_dir(remote_subdir, trial_id)
         # Land each robot's tree under <local_dir>/<robot_name>/.
         per_robot_local = pathlib.Path(local_dir) / robot.name
         per_robot_local.mkdir(parents=True, exist_ok=True)
